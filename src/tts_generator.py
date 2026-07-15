@@ -32,13 +32,18 @@ def generate_audio(json_path, output_dir="output", voice="alloy", model="tts-1")
     audio_path = os.path.join(output_dir, f"{ticker}_{topic}_podcast.mp3")
 
     response = client.audio.speech.create(
-        model=model,
-        voice=voice,
+        model="gpt-4o-mini-tts",
+        voice="onyx",
         input=script,
+        instructions=(
+        "Speak like a friendly, seasoned financial podcast host. "
+        "Conversational pacing with natural pauses, varied intonation, "
+        "slight emphasis on numbers and company names. Not newsreader-stiff."
     )
     response.stream_to_file(audio_path)
 
     return audio_path
+
 
 
 if __name__ == "__main__":
