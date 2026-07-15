@@ -1,6 +1,3 @@
-# FastAPI/Gradio application
-# Author: Mudit Airan
-
 """
 futuresignal.podcast — Gradio demo app
 
@@ -15,27 +12,37 @@ Run with:
 NOTE ON GENERATION LOGIC
 ------------------------
 `generate_episode()` below is a MOCK generator: it stitches the user's
-inputs into a title/description/script outline using simple templates.
-In a real deployment you would replace the body of that function with:
+inputs into a title/description/script outline using simple templates,
+and `_write_placeholder_audio()` writes a few seconds of silence to disk
+in place of real narration. In a real deployment you would replace those
+with:
     - a call to an LLM (e.g. the Anthropic API) to write the script from
-      the industry, blurb, risk profile, and any uploaded document/URL
-      content, and
+      the topic, blurb, and optional company/ticker, and
     - a TTS call (e.g. ElevenLabs, OpenAI TTS) to turn the script into an
-      actual audio file, which you'd then pass to gr.Audio instead of the
-      placeholder cover-only card used here.
+      actual audio file, writing its bytes to the same `data/<id>.wav`
+      path instead of synthesizing silence.
+
+NOTE ON PERSISTENCE
+--------------------
+Every generated (and seed) episode is a `Podcast` dataclass instance.
+Its audio lives on disk at DATA_DIR / f"{id}.wav" (audio_url holds that
+path); everything else (script, keywords, sources, etc.) stays in the
+in-memory `podcasts_state` for this demo. A real deployment would also
+persist the Podcast records themselves (DB / JSON file) so history
+survives a server restart — out of scope here.
 
 NOTE ON THE TILE GRID / CAROUSEL
 ---------------------------------
 Tiles are NOT a gr.Gallery. gr.Gallery only supports a single plain-text
 caption per item, which isn't enough to reproduce the Apple Podcasts tile
-(cover art, title, "Created on ..." line, keyword tags). Instead this app
-pre-builds a fixed grid of MAX_TILES (col, image, caption) component
-triples and shows/hides + refills them as podcasts are added. That's a
-common Gradio pattern for "dynamic-looking" grids of clickable, richly
-captioned cards. Raise MAX_TILES if you expect a user to generate more
-episodes than that in one session.
+(cover art, title, "Created on ..." line, keyword tags). Instead the tile
+grid is built with `@gr.render(inputs=[podcasts_state])`: it re-runs
+whenever podcasts_state changes (i.e. right after a new episode is
+generated) and rebuilds exactly one tile per podcast — no fixed slot
+count, no show/hide padding. MAX_TILES is just a soft cap on how many
+episodes this demo grid will hold, not a pre-allocated component count.
 
-All MAX_TILES tiles live in a single gr.Row with CSS `overflow-x: auto` +
+All tiles live in a single gr.Row with CSS `overflow-x: auto` +
 `scroll-snap-type: x mandatory` (see `.fsp-carousel-track` below), which
 turns it into a native, dependency-free horizontal carousel — no JS
 carousel library needed. SLIDES_PER_VIEW controls how many tiles are
@@ -48,8 +55,14 @@ round-trip.
 import base64
 import hashlib
 import io
+import pathlib
+import struct
 import textwrap
+import uuid
+import wave
+from dataclasses import dataclass, field
 from datetime import datetime
+
 import gradio as gr
 from PIL import Image, ImageDraw, ImageFont
 
@@ -58,37 +71,67 @@ from PIL import Image, ImageDraw, ImageFont
 # --------------------------------------------------------------------------
 
 APP_TITLE = "futuresignal.podcast"
-MAX_TILES = 12
+MAX_TILES = 24  # soft cap on generated episodes this demo grid will hold
 SLIDES_PER_VIEW = 4  # how many tiles are visible at once in the carousel
 TILE_GAP_PX = 16  # matches Gradio's default Row gap; used for the width calc()
 
-INDUSTRIES = [
-    "Artificial Intelligence & Software",
-    "Semiconductors & Hardware",
-    "Biotech & Pharma",
-    "Energy & Utilities",
-    "Financial Services & Fintech",
-    "Consumer & Retail",
-    "Industrials & Manufacturing",
-    "Real Estate & Construction",
-    "Telecom & Media",
-    "Crypto & Digital Assets",
-]
+# Generated audio (currently a placeholder tone — see NOTE ON GENERATION
+# LOGIC above) is written here. Resolved relative to the process's working
+# directory, which for this notebook / `python main.py` run from src/ is
+# src/data/.
+DATA_DIR = pathlib.Path("data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+AUDIO_DURATION_SEC = 3
+AUDIO_FRAMERATE = 22050
 
-RISK_LEVELS = ["Low", "Medium", "High"]
-RISK_TOOLTIPS = {
-    "Low": "Conservative, protect capital, avoid losses",
-    "Medium": "Balance growth and stability",
-    "High": "Maximize returns",
+# (label, slug) pairs for the "Topics" picklist. The dropdown shows the
+# label only ("Blockchain"); generate_episode() receives the slug
+# ("blockchain") as the actual value — see TOPIC_LABELS/TOPIC_KEYWORDS.
+TOPICS = [
+    ("Blockchain", "blockchain"),
+    ("Earnings", "earnings"),
+    ("IPO", "ipo"),
+    ("Mergers & Acquisitions", "mergers_and_acquisitions"),
+    ("Financial Markets", "financial_markets"),
+    ("Economy - Fiscal Policy (e.g., tax reform, government spending)", "economy_fiscal"),
+    ("Economy - Monetary Policy (e.g., interest rates, inflation)", "economy_monetary"),
+    ("Economy - Macro/Overall", "economy_macro"),
+    ("Energy & Transportation", "energy_transportation"),
+    ("Finance", "finance"),
+    ("Life Sciences", "life_sciences"),
+    ("Manufacturing", "manufacturing"),
+    ("Real Estate & Construction", "real_estate"),
+    ("Retail & Wholesale", "retail_wholesale"),
+    ("Technology", "technology"),
+]
+TOPIC_LABELS = {slug: label for label, slug in TOPICS}
+
+# A handful of representative keywords per topic, shown as tag pills on
+# each tile (2-3 max).
+TOPIC_KEYWORDS = {
+    "blockchain": ["Blockchain", "Crypto", "Digital Assets"],
+    "earnings": ["Earnings", "Guidance", "Quarterly Results"],
+    "ipo": ["IPO", "Public Listing", "Underwriters"],
+    "mergers_and_acquisitions": ["M&A", "Deal Flow", "Synergies"],
+    "financial_markets": ["Markets", "Volatility", "Trading"],
+    "economy_fiscal": ["Fiscal Policy", "Tax Reform", "Gov Spending"],
+    "economy_monetary": ["Monetary Policy", "Interest Rates", "Inflation"],
+    "economy_macro": ["Macro", "GDP", "Global Economy"],
+    "energy_transportation": ["Energy", "Transportation", "Logistics"],
+    "finance": ["Finance", "Banking", "Capital Markets"],
+    "life_sciences": ["Life Sciences", "Biotech", "Healthcare"],
+    "manufacturing": ["Manufacturing", "Industrials", "Supply Chain"],
+    "real_estate": ["Real Estate", "Construction", "REITs"],
+    "retail_wholesale": ["Retail", "Wholesale", "Consumer"],
+    "technology": ["Technology", "Software", "Innovation"],
 }
-RISK_HORIZON = {"Low": "Long Game", "Medium": "Balanced Play", "High": "Fast Money"}
 
 # A handful of representative keywords per industry, shown as tag pills on
-# each tile (2-3 max). Generated episodes fall back to a derived tag if
-# their industry isn't in this map (e.g. a custom-typed industry).
+# each tile (2-3 max). Used as a generic fallback in _build_podcast() when
+# no explicit keywords are supplied (e.g. by future callers).
 INDUSTRY_KEYWORDS = {
     "Artificial Intelligence & Software": ["AI", "Cloud", "Enterprise Software"],
-    "Semiconductors & Hardware": ["Chips", "Fabs", "Processors"],
+    "Semiconductors & Hardware": ["Chips", "Fabs", "Supply Chain"],
     "Biotech & Pharma": ["Biotech", "Clinical Trials", "Healthcare"],
     "Energy & Utilities": ["Energy", "Grid", "Utilities"],
     "Financial Services & Fintech": ["Fintech", "Payments", "Banking"],
@@ -98,6 +141,39 @@ INDUSTRY_KEYWORDS = {
     "Telecom & Media": ["Telecom", "Media", "Streaming"],
     "Crypto & Digital Assets": ["Crypto", "Digital Assets", "Blockchain"],
 }
+
+# Default, non-exhaustive list of well-known US-exchange-listed companies
+# for the "Company name / Ticker" field. Gradio's Dropdown filters this
+# list client-side as the user types (matching name or ticker); users can
+# still type any ticker not on this list (allow_custom_value=True).
+COMPANY_CHOICES = [
+    ("Apple (AAPL)", "AAPL"), ("Microsoft (MSFT)", "MSFT"), ("Alphabet (GOOGL)", "GOOGL"),
+    ("Amazon (AMZN)", "AMZN"), ("Meta Platforms (META)", "META"), ("Nvidia (NVDA)", "NVDA"),
+    ("Tesla (TSLA)", "TSLA"), ("Netflix (NFLX)", "NFLX"), ("Adobe (ADBE)", "ADBE"),
+    ("Salesforce (CRM)", "CRM"), ("Oracle (ORCL)", "ORCL"), ("IBM (IBM)", "IBM"),
+    ("Intel (INTC)", "INTC"), ("AMD (AMD)", "AMD"), ("Cisco (CSCO)", "CSCO"),
+    ("Qualcomm (QCOM)", "QCOM"), ("Broadcom (AVGO)", "AVGO"), ("Micron (MU)", "MU"),
+    ("Texas Instruments (TXN)", "TXN"), ("Palantir (PLTR)", "PLTR"), ("Uber (UBER)", "UBER"),
+    ("Airbnb (ABNB)", "ABNB"), ("Shopify (SHOP)", "SHOP"), ("PayPal (PYPL)", "PYPL"),
+    ("Snowflake (SNOW)", "SNOW"), ("ServiceNow (NOW)", "NOW"), ("Workday (WDAY)", "WDAY"),
+    ("Zoom (ZM)", "ZM"), ("CrowdStrike (CRWD)", "CRWD"), ("Palo Alto Networks (PANW)", "PANW"),
+    ("JPMorgan Chase (JPM)", "JPM"), ("Bank of America (BAC)", "BAC"), ("Wells Fargo (WFC)", "WFC"),
+    ("Goldman Sachs (GS)", "GS"), ("Morgan Stanley (MS)", "MS"), ("Citigroup (C)", "C"),
+    ("Visa (V)", "V"), ("Mastercard (MA)", "MA"), ("American Express (AXP)", "AXP"),
+    ("BlackRock (BLK)", "BLK"), ("Charles Schwab (SCHW)", "SCHW"), ("Berkshire Hathaway (BRK.B)", "BRK.B"),
+    ("Johnson & Johnson (JNJ)", "JNJ"), ("Pfizer (PFE)", "PFE"), ("UnitedHealth Group (UNH)", "UNH"),
+    ("Eli Lilly (LLY)", "LLY"), ("Merck (MRK)", "MRK"), ("AbbVie (ABBV)", "ABBV"),
+    ("Moderna (MRNA)", "MRNA"), ("Amgen (AMGN)", "AMGN"), ("Gilead Sciences (GILD)", "GILD"),
+    ("CVS Health (CVS)", "CVS"), ("Walmart (WMT)", "WMT"), ("Costco (COST)", "COST"),
+    ("Target (TGT)", "TGT"), ("Home Depot (HD)", "HD"), ("Nike (NKE)", "NKE"),
+    ("McDonald's (MCD)", "MCD"), ("Starbucks (SBUX)", "SBUX"), ("Coca-Cola (KO)", "KO"),
+    ("PepsiCo (PEP)", "PEP"), ("Procter & Gamble (PG)", "PG"), ("ExxonMobil (XOM)", "XOM"),
+    ("Chevron (CVX)", "CVX"), ("Boeing (BA)", "BA"), ("Caterpillar (CAT)", "CAT"),
+    ("General Electric (GE)", "GE"), ("Honeywell (HON)", "HON"), ("3M (MMM)", "MMM"),
+    ("Ford (F)", "F"), ("General Motors (GM)", "GM"), ("Verizon (VZ)", "VZ"),
+    ("AT&T (T)", "T"), ("Comcast (CMCSA)", "CMCSA"), ("Walt Disney (DIS)", "DIS"),
+    ("Warner Bros Discovery (WBD)", "WBD"), ("Prologis (PLD)", "PLD"), ("American Tower (AMT)", "AMT"),
+]
 
 # A handful of dark, high-contrast palettes so generated covers look
 # distinct from one another, echoing the Apple Podcasts grid.
@@ -109,6 +185,27 @@ PALETTES = [
     ((70, 25, 20), (240, 120, 60)),  # maroon -> orange
     ((20, 30, 60), (80, 170, 240)),  # navy -> sky blue
 ]
+
+
+# --------------------------------------------------------------------------
+# Podcast data model
+# --------------------------------------------------------------------------
+
+@dataclass
+class Podcast:
+    id: str                      # unique ID for history / audio filename
+    industry: str
+    generated_date: datetime
+    script: str                  # full text script
+    audio_url: str               # path to the generated audio file
+    sources_used: list           # e.g. ["Uploaded Document", "Web Link"]
+    podcast_title: str
+    podcast_keywords: list
+    cover: Image.Image = field(default=None, repr=False, compare=False)
+
+
+def _format_date(dt: datetime) -> str:
+    return f"{dt.day}. {dt.strftime('%B %Y')}"
 
 
 # --------------------------------------------------------------------------
@@ -164,39 +261,58 @@ def _img_to_b64(img: Image.Image, size=(56, 56)) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
+def _write_placeholder_audio(podcast_id: str) -> str:
+    """Write a few seconds of silence as a stand-in for real TTS narration
+    (see NOTE ON GENERATION LOGIC at the top). Returns the file path."""
+    path = DATA_DIR / f"{podcast_id}.wav"
+    n_frames = AUDIO_DURATION_SEC * AUDIO_FRAMERATE
+    with wave.open(str(path), "w") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(AUDIO_FRAMERATE)
+        wf.writeframes(struct.pack(f"<{n_frames}h", *([0] * n_frames)))
+    return str(path)
+
+
 # --------------------------------------------------------------------------
 # Episode construction
 # --------------------------------------------------------------------------
 
-def _build_entry(title, industry, risk, blurb, source_note, keywords=None):
+def _build_podcast(title, industry, blurb, keywords, sources_used=None, company="") -> Podcast:
+    pid = uuid.uuid4().hex[:12]
     cover = make_cover(title, industry)
-    _now = datetime.now()
-    created_display = f"{_now.day}. {_now.strftime('%B %Y')}"
-    keywords = (keywords or INDUSTRY_KEYWORDS.get(industry, [industry.split(" & ")[0]]))[:3]
+    now = datetime.now()
+    audio_url = _write_placeholder_audio(pid)
+    cold_open = (
+        f"1. Cold open — why {industry.lower()} matters right now, "
+        f"with a focus on {company}.\n" if company else
+        f"1. Cold open — why {industry.lower()} matters right now.\n"
+    )
     script = (
         f"**{title}**\n\n"
-        f"*Industry:* {industry}  \n"
-        f"*Risk profile:* {risk} — {RISK_TOOLTIPS.get(risk, '')}  \n"
-        f"*Generated:* {_now.strftime('%d %b %Y, %H:%M')}\n\n"
+        f"*Topic:* {industry}  \n"
+        f"*Company / Ticker:* {company or 'General market coverage'}  \n"
+        f"*Generated:* {now.strftime('%d %b %Y, %H:%M')}\n\n"
         f"**Brief:** {blurb}\n\n"
-        f"**Source:** {source_note}\n\n"
         "---\n"
         "**Episode outline** *(mock script — wire up an LLM call here)*\n\n"
-        f"1. Cold open — why this matters in {industry.lower()} right now.\n"
-        f"2. Market backdrop tailored to the stated brief and geography.\n"
-        f"3. The case *for*, framed around a {risk.lower()}-risk horizon.\n"
+        f"{cold_open}"
+        "2. Market backdrop tailored to the stated brief.\n"
+        "3. The case for and against, and what's already priced in.\n"
         "4. Key risks and what would change the thesis.\n"
         "5. Close — one thing to watch this week.\n"
     )
-    return dict(title=title, industry=industry, risk=risk, blurb=blurb,
-                source_note=source_note, cover=cover, script=script,
-                created_display=created_display, keywords=keywords)
+    return Podcast(
+        id=pid, industry=industry, generated_date=now,
+        script=script, audio_url=audio_url, sources_used=sources_used or [],
+        podcast_title=title, podcast_keywords=keywords[:3], cover=cover,
+    )
 
 
-def _mock_title(industry: str, risk: str) -> str:
-    horizon = RISK_HORIZON.get(risk, "Long Game")
-    short_industry = industry.split(" & ")[0]
-    return f"{short_industry}: The {horizon}"
+def _mock_title(topic_label: str, company: str) -> str:
+    if company:
+        return f"{company}: {topic_label}"
+    return f"{topic_label}: Market Signal"
 
 
 # --------------------------------------------------------------------------
@@ -208,55 +324,47 @@ def _seed_podcasts():
         dict(
             title="AI Capex Supercycle",
             industry="Artificial Intelligence & Software",
-            risk="High",
             blurb="US/EU hyperscaler capex acceleration, GPU supply constraints, "
                   "and where the next leg of the AI infrastructure trade sits.",
-            source_note="No source document attached.",
             keywords=["AI Infrastructure", "GPUs", "Hyperscalers"],
         ),
         dict(
             title="Grid Under Pressure",
             industry="Energy & Utilities",
-            risk="Low",
             blurb="North American grid bottlenecks from data-center power demand; "
                   "long-duration storage and transmission names for patient capital.",
-            source_note="No source document attached.",
             keywords=["Power Grid", "Data Centers", "Storage"],
         ),
         dict(
             title="Fintech Rails Rewired",
             industry="Financial Services & Fintech",
-            risk="High",
             blurb="Stablecoin settlement rails encroaching on card networks in "
                   "cross-border payments; who benefits, who gets disintermediated.",
-            source_note="No source document attached.",
             keywords=["Stablecoins", "Payments"],
         ),
         dict(
             title="Fab Nationalism",
             industry="Semiconductors & Hardware",
-            risk="Low",
             blurb="Reshored fab capacity in the US, EU and Japan; subsidy economics "
                   "and multi-year demand visibility for equipment suppliers.",
-            source_note="No source document attached.",
             keywords=["Semiconductors", "Reshoring", "Subsidies"],
         ),
     ]
-    return [_build_entry(**s) for s in seeds]
+    return [_build_podcast(**s) for s in seeds]
 
 
 # --------------------------------------------------------------------------
 # Tile caption (title, "Created on ..." line, keyword tags)
 # --------------------------------------------------------------------------
 
-def _tile_caption(p: dict) -> str:
+def _tile_caption(p: Podcast) -> str:
     tags_html = "".join(
-        f'<span class="fsp-tile-tag">{kw}</span>' for kw in p.get("keywords", [])[:3]
+        f'<span class="fsp-tile-tag">{kw}</span>' for kw in p.podcast_keywords[:3]
     )
     return (
         f'<div class="fsp-tile-cap">'
-        f'<div class="fsp-tile-title">{p["title"]}</div>'
-        f'<div class="fsp-tile-updated">Created on {p["created_display"]}</div>'
+        f'<div class="fsp-tile-title">{p.podcast_title}</div>'
+        f'<div class="fsp-tile-updated">Created on {_format_date(p.generated_date)}</div>'
         f'<div class="fsp-tile-tags">{tags_html}</div>'
         f'</div>'
     )
@@ -266,16 +374,16 @@ def _tile_caption(p: dict) -> str:
 # Player bar (persistent bottom bar, shown when a tile is played)
 # --------------------------------------------------------------------------
 
-def make_player_html(podcast: dict) -> str:
+def make_player_html(podcast: Podcast) -> str:
     """Build a mini-player bar in the style of the Apple Podcasts player:
     speed, -15s, play, +30s, sleep timer | cover + title/date + scrubber |
     transcript, queue, cast, volume. The overflow ("...") menu is omitted
     on purpose. Rendered inside a fixed-position wrapper (#fsp-player-bar,
     see CUSTOM_CSS) so it behaves like a persistent bottom player.
     """
-    thumb_b64 = _img_to_b64(podcast["cover"])
-    title = podcast["title"]
-    date = podcast["created_display"]
+    thumb_b64 = _img_to_b64(podcast.cover)
+    title = podcast.podcast_title
+    date = _format_date(podcast.generated_date)
 
     return f"""
     <style>
@@ -380,98 +488,51 @@ def make_player_html(podcast: dict) -> str:
 # Episode generation (mock)
 # --------------------------------------------------------------------------
 
-def render_tile_updates(podcasts):
-    """Build gr.update(...) triples (column visible, image, caption) for
-    every slot in the fixed MAX_TILES grid, based on the current podcast
-    list. Extra slots beyond len(podcasts) are hidden."""
-    updates = []
-    for i in range(MAX_TILES):
-        if i < len(podcasts):
-            p = podcasts[i]
-            updates.append(gr.update(visible=True))                 # column
-            updates.append(gr.update(value=p["cover"]))              # image
-            updates.append(gr.update(value=_tile_caption(p)))        # caption
-        else:
-            updates.append(gr.update(visible=False))
-            updates.append(gr.update())
-            updates.append(gr.update())
-    return updates
-
-
-def _noop_tile_updates():
-    return [gr.update() for _ in range(MAX_TILES * 3)]
-
-
 def _reset_gen_btn():
     return gr.update(value="Generate podcast", interactive=True)
 
 
-def generate_episode(industry, blurb, doc_file, url, risk, podcasts):
+def generate_episode(topic, blurb, company, podcasts):
     # --- validation ---------------------------------------------------
     # Uses gr.Warning (a toast that does NOT halt execution) instead of
     # gr.Error, so we can still return a full no-op output tuple that
     # resets the "Generating…" button back to normal. Raising gr.Error
     # here would abort the .then() chain and leave the button stuck.
     common_noop = (gr.update(), gr.update(), gr.update(), gr.update(),
-                   gr.update(), gr.update(), gr.update(), gr.update(), gr.update())
+                   gr.update(), gr.update(), gr.update())
 
-    if not industry:
-        gr.Warning("Please choose (or type) an industry / sector.")
-        return (podcasts, *common_noop, *_noop_tile_updates(), _reset_gen_btn())
+    if not topic:
+        gr.Warning("Please choose a topic.")
+        return (podcasts, *common_noop, _reset_gen_btn())
     if not blurb or not blurb.strip():
         gr.Warning("The market blurb is mandatory — please add a few sentences.")
-        return (podcasts, *common_noop, *_noop_tile_updates(), _reset_gen_btn())
+        return (podcasts, *common_noop, _reset_gen_btn())
     if len(blurb) > 200:
         gr.Warning(f"Blurb is {len(blurb)} characters — please trim to 200 or fewer.")
-        return (podcasts, *common_noop, *_noop_tile_updates(), _reset_gen_btn())
-    if not risk:
-        gr.Warning("Please select a risk appetite.")
-        return (podcasts, *common_noop, *_noop_tile_updates(), _reset_gen_btn())
+        return (podcasts, *common_noop, _reset_gen_btn())
     if len(podcasts) >= MAX_TILES:
         gr.Warning(f"Demo grid is capped at {MAX_TILES} podcasts — raise MAX_TILES to allow more.")
-        return (podcasts, *common_noop, *_noop_tile_updates(), _reset_gen_btn())
+        return (podcasts, *common_noop, _reset_gen_btn())
 
-    # --- optional source note ---------------------------------------
-    source_bits = []
-    if doc_file is not None:
-        source_bits.append(f"uploaded document `{doc_file.split('/')[-1]}`")
-    if url and url.strip():
-        source_bits.append(f"linked reference [{url.strip()}]({url.strip()})")
-    source_note = "; ".join(source_bits) if source_bits else "No source document attached."
-
-    title = _mock_title(industry, risk)
-    keywords = INDUSTRY_KEYWORDS.get(industry, [industry.split(" & ")[0], risk])[:3]
-    entry = _build_entry(title, industry, risk, blurb.strip(), source_note, keywords)
+    topic_label = TOPIC_LABELS.get(topic, topic)
+    company = (company or "").strip()
+    keywords = TOPIC_KEYWORDS.get(topic, [topic_label])[:3]
+    title = _mock_title(topic_label, company)
+    entry = _build_podcast(title, topic_label, blurb.strip(), keywords, company=company)
 
     podcasts = podcasts + [entry]
-    tile_updates = render_tile_updates(podcasts)
 
     return (
         podcasts,               # state
         gr.update(visible=True),   # home_view
         gr.update(visible=False),  # create_view
         gr.update(value=make_player_html(entry), visible=True),  # player_bar
-        gr.update(value=entry["script"], visible=True),  # details
-        gr.update(value=None),   # reset industry
+        gr.update(value=entry.script, visible=True),  # details
+        gr.update(value=None),   # reset topic
         gr.update(value=""),     # reset blurb
-        gr.update(value=None),   # reset doc
-        gr.update(value=""),     # reset url
-        gr.update(value=None),   # reset risk
-        *tile_updates,
+        gr.update(value=None),   # reset company
         _reset_gen_btn(),
     )
-
-
-def make_tile_click_handler(index):
-    def handler(podcasts):
-        if index >= len(podcasts):
-            return gr.update(), gr.update()
-        p = podcasts[index]
-        return (
-            gr.update(value=make_player_html(p), visible=True),   # player_bar
-            gr.update(value=p["script"], visible=True),           # details
-        )
-    return handler
 
 
 def go_to_create():
@@ -554,19 +615,6 @@ CUSTOM_CSS = """
 .fsp-carousel-nav { justify-content: flex-end !important; gap: 8px; margin-bottom: 4px; }
 .fsp-carousel-btn { min-width: 40px !important; max-width: 40px !important; border-radius: 999px !important; }
 
-/* ---- Risk toggle group (Low / Medium / High segmented control) ---- */
-.fsp-risk-toggle .wrap { display: flex !important; gap: 8px; }
-.fsp-risk-toggle label {
-    flex: 1; justify-content: center; text-align: center;
-    border: 1px solid #3a3a3f !important; border-radius: 999px !important;
-    background: #1c1c1e !important; padding: 10px 0 !important;
-    cursor: help;
-}
-.fsp-risk-toggle label:has(input:checked) {
-    background: #6c3ce9 !important; border-color: #6c3ce9 !important;
-}
-.fsp-risk-toggle input[type="radio"] { display: none !important; }
-
 /* ---- Persistent bottom player ---- */
 #fsp-player-bar {
     position: fixed !important;
@@ -585,11 +633,10 @@ CUSTOM_CSS += f"""
 }}
 """
 
-# Client-side only: (1) wire the Prev/Next carousel buttons to scroll the
-# track (no server round-trip needed for a visual scroll), and (2) attach
-# native title-attribute tooltips to the risk toggle options. Re-runs on an
-# interval because Gradio re-renders parts of the DOM on state updates,
-# which would otherwise wipe listeners/attributes we attached once.
+# Client-side only: wires the Prev/Next carousel buttons to scroll the
+# track (no server round-trip needed for a visual scroll). Re-runs on an
+# interval because Gradio re-renders the tile grid on state updates, which
+# would otherwise wipe the listeners we attached once.
 HEAD_SCRIPT = """
 <script>
 function fspTick() {
@@ -608,13 +655,6 @@ function fspTick() {
     next.dataset.fspBound = "1";
     next.addEventListener('click', (e) => { e.preventDefault(); track.scrollBy({left: step(), behavior: 'smooth'}); });
   }
-  const tips = {"Low": "Conservative, protect capital, avoid losses",
-                "Medium": "Balance growth and stability",
-                "High": "Maximize returns"};
-  document.querySelectorAll('.fsp-risk-toggle label').forEach((label) => {
-    const text = label.textContent.trim();
-    if (tips[text] && label.title !== tips[text]) { label.title = tips[text]; }
-  });
 }
 setInterval(fspTick, 800);
 </script>
@@ -624,7 +664,6 @@ with gr.Blocks(title=APP_TITLE) as demo:
     gr.Markdown(f"# 🎙️ {APP_TITLE}", elem_id="app-title")
 
     podcasts_state = gr.State(_seed_podcasts())
-    seed = podcasts_state.value
 
     # ---------------- Home view ----------------
     with gr.Column(visible=True) as home_view:
@@ -634,24 +673,34 @@ with gr.Blocks(title=APP_TITLE) as demo:
             prev_btn = gr.Button("‹", elem_id="fsp-carousel-prev", elem_classes="fsp-carousel-btn")
             next_btn = gr.Button("›", elem_id="fsp-carousel-next", elem_classes="fsp-carousel-btn")
 
-        tile_cols, tile_imgs, tile_caps = [], [], []
-        with gr.Row(elem_classes="fsp-carousel-track"):
-            for i in range(MAX_TILES):
-                has_seed = i < len(seed)
-                with gr.Column(visible=has_seed, min_width=140, elem_classes="fsp-tile-col") as col:
-                    img = gr.Image(
-                        value=seed[i]["cover"] if has_seed else None,
-                        show_label=False, container=False,
-                        interactive=False,
-                        buttons=[],
-                        elem_classes="fsp-tile-img",
-                    )
-                    cap = gr.HTML(
-                        value=_tile_caption(seed[i]) if has_seed else "",
-                    )
-                tile_cols.append(col)
-                tile_imgs.append(img)
-                tile_caps.append(cap)
+        # Rebuilds one tile per podcast every time podcasts_state changes
+        # (initial load + right after a new episode is generated) instead
+        # of pre-allocating a fixed MAX_TILES grid of show/hide slots.
+        @gr.render(inputs=[podcasts_state])
+        def render_tiles(podcasts):
+            with gr.Row(elem_classes="fsp-carousel-track"):
+                for p in podcasts:
+                    with gr.Column(min_width=140, elem_classes="fsp-tile-col"):
+                        img = gr.Image(
+                            value=p.cover,
+                            show_label=False, container=False,
+                            interactive=False,
+                            buttons=[],
+                            elem_classes="fsp-tile-img",
+                        )
+                        gr.HTML(value=_tile_caption(p))
+
+                    # `podcast=p` binds the current loop value as a default
+                    # argument, so each tile's handler closes over its own
+                    # podcast instead of whatever `p` is by the time it's
+                    # actually clicked (the classic loop-closure pitfall).
+                    def _play(podcast=p):
+                        return (
+                            gr.update(value=make_player_html(podcast), visible=True),
+                            gr.update(value=podcast.script, visible=True),
+                        )
+
+                    img.select(_play, outputs=[player_bar, details])
 
         details = gr.Markdown(visible=False)
         new_btn = gr.Button("+ New Podcast", variant="primary")
@@ -660,9 +709,15 @@ with gr.Blocks(title=APP_TITLE) as demo:
     with gr.Column(visible=False) as create_view:
         gr.Markdown("## Create a new podcast episode", elem_id="section-title")
 
-        industry = gr.Dropdown(
-            choices=INDUSTRIES,
-            label="Industry / Sector",
+        topic = gr.Dropdown(
+            choices=TOPICS,
+            label="Topics",
+        )
+        company = gr.Dropdown(
+            choices=COMPANY_CHOICES,
+            value=None,
+            label="Company name / Ticker",
+            info="Enter a company name like Apple or ticker name like AAPL",
             allow_custom_value=True,
         )
         blurb = gr.Textbox(
@@ -671,18 +726,6 @@ with gr.Blocks(title=APP_TITLE) as demo:
             lines=4,
             placeholder="e.g. Focused on US mid-cap industrials, looking to rotate "
                         "out of cash over the next 2 quarters amid rate-cut expectations...",
-        )
-        with gr.Row():
-            doc = gr.File(
-                label="Optional: upload article / PDF / research paper",
-                file_types=[".pdf", ".txt", ".doc", ".docx"],
-            )
-            url = gr.Textbox(label="Optional: link to article / research paper")
-
-        risk = gr.Radio(
-            choices=RISK_LEVELS,
-            label="Risk appetite / risk profile",
-            elem_classes="fsp-risk-toggle",
         )
 
         with gr.Row():
@@ -706,28 +749,16 @@ with gr.Blocks(title=APP_TITLE) as demo:
               .then(go_to_home, outputs=[home_view, create_view]) \
               .then(lambda: gr.update(value="Cancel", interactive=True), outputs=[cancel_btn])
 
-    tile_output_components = []
-    for col, img, cap in zip(tile_cols, tile_imgs, tile_caps):
-        tile_output_components.extend([col, img, cap])
-
     gen_btn.click(lambda: _loading_update("Generating"), outputs=[gen_btn]) \
            .then(
                 generate_episode,
-                inputs=[industry, blurb, doc, url, risk, podcasts_state],
+                inputs=[topic, blurb, company, podcasts_state],
                 outputs=[
                     podcasts_state, home_view, create_view, player_bar, details,
-                    industry, blurb, doc, url, risk,
-                    *tile_output_components,
+                    topic, blurb, company,
                     gen_btn,
                 ],
             )
-
-    for idx, img in enumerate(tile_imgs):
-        img.select(
-            make_tile_click_handler(idx),
-            inputs=[podcasts_state],
-            outputs=[player_bar, details],
-        )
 
 
 if __name__ == "__main__":
@@ -735,4 +766,3 @@ if __name__ == "__main__":
     # installs, move theme=/css=/head= into the gr.Blocks(...) call above.
     demo.launch(theme=gr.themes.Base(primary_hue="purple"), css=CUSTOM_CSS,
                 head=HEAD_SCRIPT, share=True)
-
