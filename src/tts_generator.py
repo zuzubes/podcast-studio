@@ -22,23 +22,22 @@ def load_script(json_path):
         return json.load(f)
 
 
-def generate_audio(json_path, output_dir="output", voice="alloy", model="tts-1"):
+def generate_audio(json_path, output_dir="output", voice="onyx", model="gpt-4o-mini-tts"):
     data = load_script(json_path)
     ticker = data["ticker"]
     topic = data["topic"]
     script = data["script"]
 
     os.makedirs(output_dir, exist_ok=True)
+    # Keyed by ticker+topic (matching save_script's filename), not ticker
+    # alone — otherwise two episodes for the same ticker but different
+    # topics would silently overwrite each other's audio file.
     audio_path = os.path.join(output_dir, f"{ticker}_{topic}_podcast.mp3")
 
     response = client.audio.speech.create(
-        model="gpt-4o-mini-tts",
-        voice="onyx",
+        model=model,
+        voice=voice,
         input=script,
-        instructions=(
-        "Speak like a friendly, seasoned financial podcast host. "
-        "Conversational pacing with natural pauses, varied intonation, "
-        "slight emphasis on numbers and company names. Not newsreader-stiff."
     )
     response.stream_to_file(audio_path)
 

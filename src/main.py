@@ -14,34 +14,28 @@ Run with:
 
 NOTE ON GENERATION LOGIC
 ------------------------
-`generate_episode()` below is a MOCK generator: it stitches the user's
-inputs into a title/description/script outline using simple templates,
-and `_write_placeholder_audio()` writes a few seconds of silence to disk
-in place of real narration. In a real deployment you would replace those
-with:
-    - a call to an LLM (e.g. the Anthropic API) to write the script from
-      the topic, blurb, and optional company/ticker, and
-    - a TTS call (e.g. ElevenLabs, OpenAI TTS) to turn the script into an
-      actual audio file, writing its bytes to the same `data/<id>.wav`
-      path instead of synthesizing silence.
+`_run_generation_pipeline()` below is the real data -> LLM -> TTS path:
+Alpha Vantage news sentiment (data_processor.py) feeds an LLM script +
+tile-metadata call (llm_processor.py), which feeds TTS narration
+(tts_generator.py). The 4 seed tiles (`_seed_podcasts()`/`_build_podcast()`)
+are the only mock content left — sample text with no audio_url, shown
+purely so the home screen isn't empty before any real episode exists.
 
 NOTE ON PERSISTENCE
 --------------------
-Every generated (and seed) episode is a `Podcast` dataclass instance.
-Its audio lives on disk at DATA_DIR / f"{id}.wav" (audio_url holds that
-path); everything else (script, keywords, sources, etc.) stays in the
-in-memory `podcasts_state` for this demo. A real deployment would also
-persist the Podcast records themselves (DB / JSON file) so history
-survives a server restart — out of scope here.
+Every generated episode is a `Podcast` dataclass instance. Its script/audio
+live on disk as DATA_DIR / f"{ticker}_{topic}_{script,podcast}.{json,mp3}"
+(see save_script/generate_audio); `_load_saved_podcasts()` rebuilds the
+Podcast list from those files on startup, so history survives a server
+restart. Seed tiles are the exception — they're regenerated fresh in
+memory each time there's no saved episode yet, never written to disk.
 
 """
 
 import hashlib
 import pathlib
-import struct
 import textwrap
 import uuid
-import wave
 import os
 import uuid
 import json
@@ -50,8 +44,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from typing import Dict, Optional
-from pathlib import Path
-from urllib.parse import quote
 
 import gradio as gr
 from PIL import Image, ImageDraw, ImageFont
@@ -76,17 +68,12 @@ MAX_TILES = 24  # soft cap on generated episodes this demo grid will hold
 SLIDES_PER_VIEW = 4  # how many tiles are visible at once in the carousel
 TILE_GAP_PX = 16  # matches Gradio's default Row gap; used for the width calc()
 
-# Generated audio (currently a placeholder tone — see NOTE ON GENERATION
-# LOGIC above) is written here. Resolved relative to the process's working
-# directory, which for this notebook / `python main.py` run from src/ is
-# src/data/.
-DATA_DIR = pathlib.Path("data")
+# Generated audio, scripts, and request JSON all live here. Anchored to this
+# file's own location (not the process's working directory) so it always
+# resolves to src/data/ — the folder .gitignore actually protects —
+# regardless of whether the app is launched from src/ or the repo root.
+DATA_DIR = pathlib.Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-
-AUDIO_DURATION_SEC = 3
-AUDIO_FRAMERATE = 22050
 
 # (label, slug) pairs for the "Topics" picklist. The dropdown shows the
 # label only ("Blockchain"); generate_episode() receives the slug
@@ -264,29 +251,20 @@ def make_cover(title: str, tag: str) -> Image.Image:
     return img
 
 
-def _write_placeholder_audio(podcast_id: str) -> str:
-    """Write a few seconds of silence as a stand-in for real TTS narration
-    (see NOTE ON GENERATION LOGIC at the top). Returns the file path."""
-    path = DATA_DIR / f"{podcast_id}.wav"
-    n_frames = AUDIO_DURATION_SEC * AUDIO_FRAMERATE
-    with wave.open(str(path), "w") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(AUDIO_FRAMERATE)
-        wf.writeframes(struct.pack(f"<{n_frames}h", *([0] * n_frames)))
-    return str(path)
-
-
 # --------------------------------------------------------------------------
 # Episode construction — mock generator, used only for the seed/demo tiles
-# (see _run_generation_pipeline() below for the real data -> LLM -> TTS path)
+# (see _run_generation_pipeline() below for the real data -> LLM -> TTS path).
+# These have no audio_url — there's a real TTS pipeline now, so writing a
+# throwaway silent .wav per seed (regenerated with a fresh random filename
+# on every app start with no real episodes yet) was pure accumulating
+# clutter with nothing real to demonstrate. _play() treats an empty
+# audio_url as "nothing to play" for both these and in-flight placeholders.
 # --------------------------------------------------------------------------
 
 def _build_podcast(title, industry, blurb, keywords, sources_used=None, company="") -> Podcast:
     pid = uuid.uuid4().hex[:12]
     cover = make_cover(title, industry)
     now = datetime.now()
-    audio_url = _write_placeholder_audio(pid)
     cold_open = (
         f"1. Cold open — why {industry.lower()} matters right now, "
         f"with a focus on {company}.\n" if company else
@@ -299,7 +277,7 @@ def _build_podcast(title, industry, blurb, keywords, sources_used=None, company=
         f"*Generated:* {now.strftime('%d %b %Y, %H:%M')}\n\n"
         f"**Brief:** {blurb}\n\n"
         "---\n"
-        "**Episode outline** *(mock script — wire up an LLM call here)*\n\n"
+        "**Episode outline** *(sample — not narrated; generate a real episode to hear one)*\n\n"
         f"{cold_open}"
         "2. Market backdrop tailored to the stated brief.\n"
         "3. The case for and against, and what's already priced in.\n"
@@ -308,7 +286,7 @@ def _build_podcast(title, industry, blurb, keywords, sources_used=None, company=
     )
     return Podcast(
         id=pid, industry=industry, generated_date=now,
-        script=script, audio_url=audio_url, sources_used=sources_used or [],
+        script=script, audio_url="", sources_used=sources_used or [],
         podcast_title=title, podcast_keywords=keywords[:3], cover=cover,
     )
 
@@ -398,7 +376,7 @@ def _run_generation_pipeline(user_input: dict, topic_label: str, pid: str) -> tu
     try:
         script_path = save_script(
             user_input["ticker"], user_input["topic"], user_input["company"]["name"],
-            user_input["user_prompt"], script, output_dir=str(DATA_DIR),
+            user_input["user_prompt"], script, title=title, tags=tags, output_dir=str(DATA_DIR),
         )
         audio_path = generate_audio(script_path, output_dir=str(DATA_DIR))
     except Exception as e:
@@ -453,6 +431,65 @@ def _seed_podcasts():
     return [_build_podcast(**s) for s in seeds]
 
 
+def _load_saved_podcasts() -> list:
+    """Rebuilds Podcast tiles from every {ticker}_{topic}_script.json in
+    DATA_DIR, so previously generated episodes survive a server restart
+    instead of only living in the in-memory podcasts_state (see
+    _run_generation_pipeline/save_script for where these files are
+    written). Skips a script file if its audio never finished generating
+    (no tile without something playable), and fills in title/tags/audio
+    filename with sensible fallbacks for files saved before those fields/
+    the ticker+topic audio naming convention existed.
+    """
+    podcasts = []
+    for script_path in sorted(DATA_DIR.glob("*_script.json")):
+        try:
+            with open(script_path) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        ticker = data.get("ticker", "")
+        topic = data.get("topic", "")
+        company_name = data.get("company_name", "")
+        topic_label = TOPIC_LABELS.get(topic, topic or "Market Signal")
+
+        audio_path = DATA_DIR / f"{ticker}_{topic}_podcast.mp3"
+        if not audio_path.exists():
+            legacy_audio_path = DATA_DIR / f"{ticker}_podcast.mp3"  # pre-topic-suffix files
+            if legacy_audio_path.exists():
+                audio_path = legacy_audio_path
+            else:
+                continue  # audio generation never finished for this script — no tile
+
+        title = data.get("title") or _mock_title(topic_label, company_name or ticker)
+        tags = [t for t in (data.get("tags") or []) if t][:3] or TOPIC_KEYWORDS.get(topic, [topic_label])[:3]
+
+        try:
+            generated_date = datetime.fromisoformat(data["generated_at"])
+        except (KeyError, ValueError, TypeError):
+            generated_date = datetime.fromtimestamp(script_path.stat().st_mtime)
+
+        podcasts.append(Podcast(
+            id=f"{ticker}_{topic}", industry=topic_label, generated_date=generated_date,
+            script=data.get("script", ""), audio_url=str(audio_path),
+            sources_used=["Alpha Vantage news sentiment"],
+            podcast_title=title, podcast_keywords=tags,
+            cover=make_cover(title, topic_label), status="ready",
+        ))
+
+    podcasts.sort(key=lambda p: p.generated_date)
+    return podcasts
+
+
+def _load_initial_podcasts() -> list:
+    """Home-screen tiles on app launch: real saved episodes if any exist
+    on disk, else the mock seed set (so a fresh checkout isn't an empty
+    grid)."""
+    saved = _load_saved_podcasts()
+    return saved if saved else _seed_podcasts()
+
+
 # --------------------------------------------------------------------------
 # Tile caption (title, "Created on ..." line, keyword tags)
 # --------------------------------------------------------------------------
@@ -480,100 +517,17 @@ def _tile_caption(p: Podcast) -> str:
 # --------------------------------------------------------------------------
 # Player bar (persistent bottom bar, shown when a tile is played)
 # --------------------------------------------------------------------------
-
-def make_player_html(podcast: Podcast) -> str:
-    """Build a mini-player bar: speed, play/pause | title/date | volume
-    (with an expandable slider). Rendered inside a fixed-position wrapper
-    (#fsp-player-bar, see CUSTOM_CSS) so it behaves like a persistent
-    bottom player.
-
-    The bar's controls are custom HTML/CSS (not gr.Audio) so they match the
-    app's look; a real hidden <audio> tag drives actual playback, wired up
-    by the delegated click handler in HEAD_SCRIPT. Its `src` uses Gradio's
-    `/file=` route, which requires the episode's directory to be in
-    `allowed_paths` on `demo.launch()` (see bottom of this file).
-    """
-    title = podcast.podcast_title
-    date = _format_date(podcast.generated_date)
-    audio_src = quote(str(Path(podcast.audio_url).resolve())) if podcast.audio_url else ""
-
-    return f"""
-    <style>
-    .fsp-player {{
-        display: flex; align-items: center; gap: 14px;
-        background: #1c1c1e; border-radius: 999px;
-        padding: 8px 16px; margin: 14px 0 6px 0;
-        font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
-        box-shadow: 0 4px 18px rgba(0,0,0,0.35);
-    }}
-    .fsp-controls {{ display: flex; align-items: center; gap: 10px; flex-shrink: 0; }}
-    .fsp-speed {{ color: #a48dfc; font-weight: 700; font-size: 13px; width: 20px; }}
-    .fsp-icon-btn {{ background: none; border: none; padding: 0; cursor: pointer;
-                      color: #f2f2f2; display: flex; align-items: center; }}
-    .fsp-icon-btn svg {{ width: 16px; height: 16px; }}
-    .fsp-play {{ background: #f2f2f2; border-radius: 50%; width: 26px; height: 26px;
-                 display: flex; align-items: center; justify-content: center; }}
-    .fsp-play svg {{ width: 11px; height: 11px; }}
-    .fsp-play .fsp-icon-play {{ margin-left: 1px; }}
-    .fsp-meta {{ flex: 1; min-width: 0; }}
-    .fsp-title {{ color: #f5f5f5; font-weight: 700; font-size: 13px;
-                  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-    .fsp-date {{ color: #9a9a9e; font-size: 11px; margin-top: 2px; }}
-    .fsp-right {{ display: flex; align-items: center; gap: 10px; flex-shrink: 0; }}
-    .fsp-volume-wrap {{ display: flex; align-items: center; gap: 8px; }}
-    .fsp-volume-pop {{
-        max-width: 0; opacity: 0; overflow: hidden;
-        transition: max-width 0.2s ease, opacity 0.2s ease;
-    }}
-    .fsp-volume-pop.fsp-open {{ max-width: 100px; opacity: 1; }}
-    .fsp-volume-range {{
-        width: 90px; height: 3px; -webkit-appearance: none; appearance: none;
-        background: #45454a; border-radius: 2px; outline: none;
-    }}
-    .fsp-volume-range::-webkit-slider-thumb {{
-        -webkit-appearance: none; appearance: none;
-        width: 11px; height: 11px; border-radius: 50%; background: #fff; cursor: pointer;
-    }}
-    .fsp-volume-range::-moz-range-thumb {{
-        width: 11px; height: 11px; border-radius: 50%; background: #fff; border: none; cursor: pointer;
-    }}
-    </style>
-
-    <audio id="fsp-audio" src="/file={audio_src}" preload="none"></audio>
-    <div class="fsp-player">
-        <div class="fsp-controls">
-            <span class="fsp-speed">2x</span>
-            <button class="fsp-icon-btn fsp-play" title="Play" data-playing="false">
-                <svg class="fsp-icon-play" viewBox="0 0 24 24" fill="#1c1c1e">
-                    <polygon points="4,2 20,12 4,22"/>
-                </svg>
-                <svg class="fsp-icon-pause" viewBox="0 0 24 24" fill="#1c1c1e" style="display:none;">
-                    <rect x="4" y="3" width="5" height="18" rx="1"/>
-                    <rect x="15" y="3" width="5" height="18" rx="1"/>
-                </svg>
-            </button>
-        </div>
-
-        <div class="fsp-meta">
-            <div class="fsp-title">{title}</div>
-            <div class="fsp-date">{date}</div>
-        </div>
-
-        <div class="fsp-right">
-            <div class="fsp-volume-wrap">
-                <div class="fsp-volume-pop">
-                    <input type="range" class="fsp-volume-range" min="0" max="100" value="80">
-                </div>
-                <button class="fsp-icon-btn fsp-volume-btn" title="Volume">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-                        <path d="M4 10v4h4l5 4V6L8 10H4z" stroke-linejoin="round"/>
-                        <path d="M16.5 9a5 5 0 0 1 0 6" stroke-linecap="round"/>
-                    </svg>
-                </button>
-            </div>
-        </div>
-    </div>
-    """
+#
+# Uses a real gr.Audio component for playback (native play/pause/seek/
+# volume), not hand-rolled HTML/JS — a previous version drove a raw <audio>
+# tag via a hand-built `/file=` URL, which needed the episode's directory
+# listed in `allowed_paths` on demo.launch() to be servable at all; any
+# mismatch there (e.g. a different launch path) made playback silently fail
+# with no error surfaced, since the failure was inside a swallowed JS
+# promise. gr.Audio sidesteps this entirely — Gradio registers whatever
+# local file path is passed as its value and serves it itself.
+def _player_label(podcast: Podcast) -> str:
+    return f"{podcast.podcast_title} — {_format_date(podcast.generated_date)}"
 
 
 # --------------------------------------------------------------------------
@@ -727,11 +681,18 @@ CUSTOM_CSS = """
     background: rgba(0,0,0,0) center / 46px no-repeat;
     transition: opacity 0.15s ease, background-color 0.15s ease;
 }
-.fsp-tile-img:hover::after {
+.fsp-tile-img:not(.fsp-tile-img-noaudio):hover::after {
     opacity: 1;
     background-color: rgba(0,0,0,0.32);
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='11' fill='white'/%3E%3Cpolygon points='9.5,7 18,12 9.5,17' fill='%231c1c1e'/%3E%3C/svg%3E");
 }
+/* Tiles with nothing playable yet (still generating, or a sample seed with
+   no real audio) get a dimmed hover instead of the play affordance. */
+.fsp-tile-img-noaudio:hover::after {
+    opacity: 1;
+    background-color: rgba(0,0,0,0.32);
+}
+.fsp-tile-img-noaudio img { cursor: default; }
 .fsp-tile-cap { padding: 8px 2px 0 2px; }
 .fsp-tile-title { color: #f2f2f2; font-size: 14px; font-weight: 600; line-height: 1.3; }
 .fsp-tile-updated { color: #9a9a9e; font-size: 12px; margin-top: 2px; }
@@ -762,11 +723,11 @@ CUSTOM_CSS = """
     position: fixed !important;
     left: 0; right: 0; bottom: 0;
     z-index: 1000;
-    padding: 0 16px 16px 16px;
-    background: linear-gradient(to top, #0d0e12 55%, transparent);
-    pointer-events: none;
+    padding: 10px 16px 16px 16px;
+    background: linear-gradient(to top, #0d0e12 65%, transparent);
 }
-#fsp-player-bar .fsp-player { pointer-events: auto; max-width: 900px; margin-left: auto; margin-right: auto; }
+#fsp-player-bar > * { max-width: 900px; margin-left: auto !important; margin-right: auto !important; }
+#fsp-stop-btn { max-width: 90px !important; flex: 0 0 auto !important; }
 """
 
 CUSTOM_CSS += f"""
@@ -781,17 +742,6 @@ CUSTOM_CSS += f"""
 # would otherwise wipe the listeners we attached once.
 HEAD_SCRIPT = """
 <script>
-function fspSyncPlayIcon(playing) {
-  const playBtn = document.querySelector('.fsp-play');
-  if (!playBtn) return;
-  playBtn.dataset.playing = playing ? 'true' : 'false';
-  playBtn.title = playing ? 'Pause' : 'Play';
-  const playIcon = playBtn.querySelector('.fsp-icon-play');
-  const pauseIcon = playBtn.querySelector('.fsp-icon-pause');
-  if (playIcon) playIcon.style.display = playing ? 'none' : '';
-  if (pauseIcon) pauseIcon.style.display = playing ? '' : 'none';
-}
-
 function fspTick() {
   const track = document.querySelector('.fsp-carousel-track');
   const prev = document.getElementById('fsp-carousel-prev');
@@ -808,55 +758,8 @@ function fspTick() {
     next.dataset.fspBound = "1";
     next.addEventListener('click', (e) => { e.preventDefault(); track.scrollBy({left: step(), behavior: 'smooth'}); });
   }
-
-  // #fsp-audio's inner HTML (and the <audio> tag itself) is replaced
-  // wholesale each time a new episode starts playing, so we (re)bind its
-  // play/pause/ended events every tick rather than once on document.
-  const audio = document.getElementById('fsp-audio');
-  if (audio && !audio.dataset.fspBound) {
-    audio.dataset.fspBound = "1";
-    audio.volume = 0.8;
-    audio.addEventListener('play', () => fspSyncPlayIcon(true));
-    audio.addEventListener('pause', () => fspSyncPlayIcon(false));
-    audio.addEventListener('ended', () => fspSyncPlayIcon(false));
-  }
-  const volumeRange = document.querySelector('.fsp-volume-range');
-  if (volumeRange && !volumeRange.dataset.fspBound) {
-    volumeRange.dataset.fspBound = "1";
-    volumeRange.addEventListener('input', () => {
-      const a = document.getElementById('fsp-audio');
-      if (a) a.volume = Number(volumeRange.value) / 100;
-    });
-  }
 }
 setInterval(fspTick, 800);
-
-// Player bar: play/pause + volume popover toggles. Bound once on
-// `document` via delegation (rather than polling like fspTick above)
-// because #fsp-player-bar itself is a stable wrapper — only its inner
-// HTML gets replaced when a new episode starts playing, so a listener
-// on document survives that regardless of how many times the content
-// underneath it is swapped out.
-document.addEventListener('click', (e) => {
-  const playBtn = e.target.closest('.fsp-play');
-  if (playBtn) {
-    const audio = document.getElementById('fsp-audio');
-    if (audio && audio.getAttribute('src')) {
-      if (audio.paused) { audio.play().catch(() => {}); } else { audio.pause(); }
-    }
-    return;
-  }
-  const volBtn = e.target.closest('.fsp-volume-btn');
-  if (volBtn) {
-    const pop = volBtn.closest('.fsp-volume-wrap').querySelector('.fsp-volume-pop');
-    if (pop) pop.classList.toggle('fsp-open');
-    return;
-  }
-  // Clicking outside the volume control closes the popover.
-  if (!e.target.closest('.fsp-volume-wrap')) {
-    document.querySelectorAll('.fsp-volume-pop.fsp-open').forEach((el) => el.classList.remove('fsp-open'));
-  }
-});
 </script>
 """
 
@@ -870,7 +773,13 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
         elem_id="app-subtitle",
     )
 
-    podcasts_state = gr.State(_seed_podcasts())
+    # A callable, not a called value — gr.State invokes this fresh on every
+    # page load, which is what makes a refresh pick up podcasts saved since
+    # the server started (including ones generated from another session/tab).
+    # Passing the already-computed list here instead would freeze one
+    # snapshot at server-startup and deep-copy that same stale list into
+    # every new session forever.
+    podcasts_state = gr.State(_load_initial_podcasts)
 
     # ---------------- Home view ----------------
     with gr.Column(visible=True) as home_view:
@@ -895,7 +804,10 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
                             show_download_button=False,
                             show_share_button=False,
                             show_fullscreen_button=False,
-                            elem_classes="fsp-tile-img",
+                            elem_classes=(
+                                ["fsp-tile-img", "fsp-tile-img-noaudio"]
+                                if not p.audio_url else "fsp-tile-img"
+                            ),
                         )
                         gr.HTML(value=_tile_caption(p))
 
@@ -904,15 +816,23 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
                     # podcast instead of whatever `p` is by the time it's
                     # actually clicked (the classic loop-closure pitfall).
                     def _play(podcast=p):
-                        if podcast.status != "ready":
-                            gr.Info("This episode is still being generated — check back shortly.")
-                            return gr.update(), gr.update()
+                        if not podcast.audio_url:
+                            if podcast.status == "generating":
+                                gr.Info("This episode is still being generated — check back shortly.")
+                            else:
+                                gr.Info("This is a sample tile with no audio — generate a real episode to hear one.")
+                            return gr.update(), gr.update(), gr.update()
                         return (
-                            gr.update(value=make_player_html(podcast), visible=True),
+                            gr.update(visible=True),
+                            gr.update(value=podcast.audio_url, label=_player_label(podcast)),
                             gr.update(value=podcast.script, visible=True),
                         )
 
-                    img.select(_play, outputs=[player_bar, details])
+                    # show_api=False: Gradio 4.44.1's auto-generated API-docs
+                    # schema crashes (TypeError in gradio_client's json-schema
+                    # -> python-type conversion) for any event with gr.Audio
+                    # as an output — this sidesteps that entirely.
+                    img.select(_play, outputs=[player_bar, player_audio, details], show_api=False)
 
         details = gr.Markdown(visible=False)
         new_btn = gr.Button("+ New Podcast", variant="primary")
@@ -950,7 +870,13 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
     # being hidden/reset by their visibility toggle. This is also what
     # fixes the old "Cancel only closes the top half" bug: there is no
     # longer a "bottom half" tied to either view's visibility at all.
-    player_bar = gr.HTML(visible=False, elem_id="fsp-player-bar")
+    with gr.Row(visible=False, elem_id="fsp-player-bar") as player_bar:
+        player_audio = gr.Audio(
+            visible=True, type="filepath", interactive=False,
+            autoplay=True, show_label=True, show_download_button=False,
+            show_share_button=False, elem_id="fsp-audio-player",
+        )
+        stop_btn = gr.Button("Stop", elem_id="fsp-stop-btn")
 
     # Carries {"pid", "user_input", "topic_label"} from _start_generation to
     # _finish_generation (None when a generate request never actually
@@ -965,6 +891,12 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
     cancel_btn.click(lambda: _loading_update("Closing"), outputs=[cancel_btn]) \
               .then(go_to_home, outputs=[home_view, create_view]) \
               .then(lambda: gr.update(value="Cancel", interactive=True), outputs=[cancel_btn])
+
+    stop_btn.click(
+        lambda: (gr.update(visible=False), gr.update(value=None)),
+        outputs=[player_bar, player_audio],
+        show_api=False,  # see the img.select() comment above
+    )
 
     # Two chained, non-generator .then() steps — not one generator function
     # — so the home screen's tile grid (@gr.render(inputs=[podcasts_state]))
@@ -990,7 +922,4 @@ if __name__ == "__main__":
     # theme=/css=/head= live on the gr.Blocks(...) call above — this
     # gradio version (4.44.1) doesn't accept them on launch() (that's a
     # Gradio >= 6.0 signature).
-    # allowed_paths lets the custom <audio src="/file=..."> tag in
-    # make_player_html() actually fetch generated/placeholder audio from
-    # DATA_DIR — Gradio blocks serving arbitrary local files otherwise.
-    demo.launch(share=True, allowed_paths=[str(DATA_DIR.resolve())])
+    demo.launch(share=True)

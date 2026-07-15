@@ -141,8 +141,11 @@ def generate_podcast_metadata(script, ticker, topic, company_name):
     return title, tags
 
 
-def save_script(ticker, topic, company_name, user_prompt, script, output_dir="output"):
-    """Write the generated podcast script to a JSON file in output_dir."""
+def save_script(ticker, topic, company_name, user_prompt, script, title=None, tags=None, output_dir="output"):
+    """Write the generated podcast script — plus tile metadata (title/tags),
+    if given — to a JSON file in output_dir. This file is the on-disk
+    record main.py reloads on startup to rebuild home-screen tiles, so
+    title/tags belong here rather than only living in memory."""
     os.makedirs(output_dir, exist_ok=True)
 
     output = {
@@ -151,6 +154,8 @@ def save_script(ticker, topic, company_name, user_prompt, script, output_dir="ou
         "company_name": company_name,
         "user_prompt": user_prompt,
         "script": script,
+        "title": title,
+        "tags": tags or [],
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 

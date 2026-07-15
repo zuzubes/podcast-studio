@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm -f /tmp/pw_*.py)",
+      "Bash(mv /tmp/data_backup/* data/)",
+      "Bash(python3 -c ' *)",
+      "Bash(nohup python3 -c ' *)",
+      "Bash(pkill -f \"server_port=7862\" 2>/dev/null *)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}
