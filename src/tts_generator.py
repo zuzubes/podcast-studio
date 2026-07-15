@@ -25,10 +25,11 @@ def load_script(json_path):
 def generate_audio(json_path, output_dir="output", voice="alloy", model="tts-1"):
     data = load_script(json_path)
     ticker = data["ticker"]
+    topic = data["topic"]
     script = data["script"]
 
     os.makedirs(output_dir, exist_ok=True)
-    audio_path = os.path.join(output_dir, f"{ticker}_podcast.mp3")
+    audio_path = os.path.join(output_dir, f"{ticker}_{topic}_podcast.mp3")
 
     response = client.audio.speech.create(
         model=model,
@@ -41,5 +42,5 @@ def generate_audio(json_path, output_dir="output", voice="alloy", model="tts-1")
 
 
 if __name__ == "__main__":
-    audio_path = generate_audio("output/AAPL_script.json")
+    audio_path = generate_audio("output/AAPL_technology_script.json")
     print(f"Saved podcast audio to: {audio_path}")

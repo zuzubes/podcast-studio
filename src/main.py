@@ -584,43 +584,43 @@ def _reset_gen_btn():
     return gr.update(value="Generate podcast", interactive=True)
 
 
-def generate_episode(topic, blurb, company, podcasts):
-    """Generator: yields once immediately to send the user home with a
-    'Generating…' placeholder tile, keeps running the real pipeline, then
-    yields again to swap that tile for the finished episode (or drop it and
-    warn, on a hard failure). Gradio streams each yield to the browser as
-    it happens, so the UI updates live across a single event handler call.
+def _start_generation(topic, blurb, company, podcasts):
+    """1st .then() step: validates the form and, if valid, immediately adds
+    a 'generating…' placeholder tile and navigates home.
+
+    This has to be a plain function, NOT a generator — @gr.render's reactive
+    re-render is wired to podcasts_state's change event, and in this Gradio
+    version (4.44.1) that change event does not fire for values yielded
+    mid-generator (only for values returned/yielded by two separate,
+    fully-completed .then() calls). See _finish_generation() below for the
+    second step, which runs the real pipeline and swaps the tile in place.
+
+    Returns the new podcasts list, view visibility, reset form fields, the
+    gen button state, and a `pending` dict for _finish_generation to consume
+    (None if generation didn't actually start, e.g. on a validation failure).
     """
-    # --- validation ---------------------------------------------------
-    # Uses gr.Warning (a toast that does NOT halt execution) instead of
-    # gr.Error, so we can still yield a full no-op output tuple that
-    # resets the "Generating…" button back to normal. Raising gr.Error
-    # here would abort the .then() chain and leave the button stuck.
-    common_noop = (gr.update(), gr.update(), gr.update(), gr.update(),
-                   gr.update(), gr.update(), gr.update())
+    def _noop(pending=None):
+        return (podcasts, gr.update(), gr.update(),
+                gr.update(), gr.update(), gr.update(),
+                _reset_gen_btn(), pending)
 
     word_count = len((blurb or "").split())
 
     if not topic:
         gr.Warning("Please choose a topic.")
-        yield (podcasts, *common_noop, _reset_gen_btn())
-        return
+        return _noop()
     if not company or not company.strip():
         gr.Warning("Please choose a company or ticker.")
-        yield (podcasts, *common_noop, _reset_gen_btn())
-        return
+        return _noop()
     if not blurb or not blurb.strip():
         gr.Warning("The context is mandatory — please add a few words to help us understand your needs.")
-        yield (podcasts, *common_noop, _reset_gen_btn())
-        return
+        return _noop()
     if word_count > 20:
         gr.Warning(f"Prompt is {word_count} words — please trim to 20 or fewer.")
-        yield (podcasts, *common_noop, _reset_gen_btn())
-        return
+        return _noop()
     if len(podcasts) >= MAX_TILES:
         gr.Warning(f"Demo grid is capped at {MAX_TILES} podcasts — raise MAX_TILES to allow more.")
-        yield (podcasts, *common_noop, _reset_gen_btn())
-        return
+        return _noop()
 
     topic_label = TOPIC_LABELS.get(topic, topic)
     company = company.strip()
@@ -636,36 +636,41 @@ def generate_episode(topic, blurb, company, podcasts):
     pid = uuid.uuid4().hex[:12]
     placeholder = _make_placeholder_podcast(pid, topic_label, company, company_name)
     podcasts = podcasts + [placeholder]
+    pending = {"pid": pid, "user_input": user_input, "topic_label": topic_label}
 
-    # --- 1st yield: send the user home immediately with the "generating"
-    # tile in place; the pipeline below keeps running in this same call. ---
-    yield (
+    return (
         podcasts,                  # state
         gr.update(visible=True),   # home_view
         gr.update(visible=False),  # create_view
-        gr.update(),               # player_bar unchanged
-        gr.update(),               # details unchanged
         gr.update(value=None),     # reset topic
         gr.update(value=""),       # reset blurb
         gr.update(value=None),     # reset company
         _reset_gen_btn(),
+        pending,
     )
 
+
+def _finish_generation(podcasts, pending):
+    """2nd .then() step: runs the real pipeline (kicked off by
+    _start_generation above) and swaps the placeholder tile for the
+    finished episode, or drops it and warns on a hard failure. No-ops if
+    `pending` is None (generation never started, e.g. failed validation)."""
+    if not pending:
+        return podcasts
+
+    pid = pending["pid"]
     try:
-        entry, pipeline_warnings = _run_generation_pipeline(user_input, topic_label, pid)
+        entry, pipeline_warnings = _run_generation_pipeline(
+            pending["user_input"], pending["topic_label"], pid,
+        )
     except PodcastGenerationError as e:
         gr.Warning(f"Couldn't generate this episode: {e}")
-        podcasts = [p for p in podcasts if p.id != pid]
-        yield (podcasts, *common_noop, gr.update())
-        return
+        return [p for p in podcasts if p.id != pid]
 
     for w in pipeline_warnings:
         gr.Warning(w)
 
-    podcasts = [entry if p.id == pid else p for p in podcasts]
-
-    # --- 2nd yield: swap the placeholder tile for the finished episode. ---
-    yield (podcasts, *common_noop, gr.update())
+    return [entry if p.id == pid else p for p in podcasts]
 
 
 def go_to_create():
@@ -947,6 +952,11 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
     # longer a "bottom half" tied to either view's visibility at all.
     player_bar = gr.HTML(visible=False, elem_id="fsp-player-bar")
 
+    # Carries {"pid", "user_input", "topic_label"} from _start_generation to
+    # _finish_generation (None when a generate request never actually
+    # started, e.g. failed validation) — see the gen_btn wiring below.
+    pending_request = gr.State(None)
+
     # ---------------- Wiring ----------------
     new_btn.click(lambda: _loading_update("Loading"), outputs=[new_btn]) \
            .then(go_to_create, outputs=[home_view, create_view]) \
@@ -956,15 +966,23 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
               .then(go_to_home, outputs=[home_view, create_view]) \
               .then(lambda: gr.update(value="Cancel", interactive=True), outputs=[cancel_btn])
 
+    # Two chained, non-generator .then() steps — not one generator function
+    # — so the home screen's tile grid (@gr.render(inputs=[podcasts_state]))
+    # actually re-renders after each one. See _start_generation's docstring.
     gen_btn.click(lambda: _loading_update("Generating"), outputs=[gen_btn]) \
            .then(
-                generate_episode,
+                _start_generation,
                 inputs=[topic, blurb, company, podcasts_state],
                 outputs=[
-                    podcasts_state, home_view, create_view, player_bar, details,
+                    podcasts_state, home_view, create_view,
                     topic, blurb, company,
-                    gen_btn,
+                    gen_btn, pending_request,
                 ],
+            ) \
+           .then(
+                _finish_generation,
+                inputs=[podcasts_state, pending_request],
+                outputs=[podcasts_state],
             )
 
 

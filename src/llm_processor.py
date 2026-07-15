@@ -57,9 +57,13 @@ def load_article_summaries(json_path):
 
 
 def summarize_articles(ticker, topic, company_name, user_prompt, news_sentiment, fetch_errors=None):
+    # This text is fed straight into tts_generator.py's TTS call with no
+    # further editing, so the rules below aren't stylistic nice-to-haves —
+    # anything markdown/meta-commentary here gets read aloud verbatim.
     system_prompt = """You write a 4-5 minute spoken podcast script (~600-750 words) about
     {company_name} ({ticker}) in the context of {topic}.
-    Structure:
+    Structure (narrate as continuous flowing speech — do NOT print these
+    labels, numbers, or timestamps in the output):
       1. Intro (30-45s) - what's happening in this topic right now
       2. News & sentiment (180-240s) - summarize key articles + sentiment
          trend based on the overall sentiment label for each of the summaries
@@ -68,7 +72,21 @@ def summarize_articles(ticker, topic, company_name, user_prompt, news_sentiment,
     User's stated interest (weight this for tone/emphasis, not as a
     source of facts): "{user_prompt}"
     If any data source is missing (see fetch_errors), acknowledge the gap
-    naturally rather than inventing numbers.""".format(
+    naturally rather than inventing numbers.
+
+    This script is read aloud by a text-to-speech engine, so:
+      - Output plain spoken prose only — no markdown (no **bold**, no
+        headers, no "---" dividers, no bullet points or numbered lists).
+      - Do not include a title, byline, or any meta-commentary about the
+        script itself (e.g. no "Podcast Script:", no "[Intro]" labels).
+      - Skip generic podcast filler — no "Welcome to the show", no made-up
+        show/host name, no "thanks for listening" sign-off. Open directly
+        with the substance and close with the recap + disclaimer only.
+      - Refer to the company by name ({company_name}), not its ticker,
+        for almost every mention. If you do need to say the ticker symbol
+        {ticker} aloud, spell it out letter by letter with hyphens (e.g.
+        "A-A-P-L") instead of writing it as a single word — a TTS engine
+        will otherwise mispronounce it as one.""".format(
         ticker=ticker, topic=topic, company_name=company_name, user_prompt=user_prompt
     )
 
@@ -136,7 +154,7 @@ def save_script(ticker, topic, company_name, user_prompt, script, output_dir="ou
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    output_path = os.path.join(output_dir, f"{ticker}_script.json")
+    output_path = os.path.join(output_dir, f"{ticker}_{topic}_script.json")
     with open(output_path, "w") as f:
         json.dump(output, f, indent=2)
 
