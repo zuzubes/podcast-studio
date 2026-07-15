@@ -178,6 +178,11 @@ COMPANY_CHOICES = [
     ("Warner Bros Discovery (WBD)", "WBD"), ("Prologis (PLD)", "PLD"), ("American Tower (AMT)", "AMT"),
 ]
 
+# Ticker -> bare company name (COMPANY_CHOICES label minus the "(TICKER)"
+# suffix), used to fill the `company.name` field of the structured request
+# payload built in generate_episode().
+COMPANY_NAMES = {ticker: label.split(" (")[0] for label, ticker in COMPANY_CHOICES}
+
 # A handful of dark, high-contrast palettes so generated covers look
 # distinct from one another, echoing the Apple Podcasts grid.
 PALETTES = [
@@ -496,10 +501,20 @@ def generate_episode(topic, blurb, company, podcasts):
     keywords = TOPIC_KEYWORDS.get(topic, [topic_label])[:3]
     title = _mock_title(topic_label, company)
 
+    user_input = {
+        "ticker": company,
+        "topic": topic,
+        "company": {"name": COMPANY_NAMES.get(company, company)},
+        "user_prompt": blurb.strip(),
+    }
+
     # ---------------------------------
     # change here for Jay's Data module
     # ---------------------------------
-    entry = _build_podcast(title, topic_label, blurb.strip(), keywords, company=company)
+    entry = _build_podcast(
+        title, topic_label, user_input["user_prompt"], keywords,
+        company=user_input["ticker"],
+    )
 
     podcasts = podcasts + [entry]
 
