@@ -314,7 +314,6 @@ def _mock_title(topic_label: str, company: str) -> str:
         return f"{company}: {topic_label}"
     return f"{topic_label}: Market Signal"
 
-
 # --------------------------------------------------------------------------
 # Seed data — a few "New Shows" so the home screen isn't empty on first load
 # --------------------------------------------------------------------------
