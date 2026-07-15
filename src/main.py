@@ -240,7 +240,11 @@ def make_cover(title: str, tag: str) -> Image.Image:
     tag_font = _load_font(22)
     title_font = _load_font(40)
 
-    draw.text((28, 28), tag.upper(), font=tag_font, fill=(255, 255, 255))
+    tag_wrapped = textwrap.wrap(tag.upper(), width=26)[:2]
+    ty = 28
+    for line in tag_wrapped:
+        draw.text((28, ty), line, font=tag_font, fill=(255, 255, 255))
+        ty += 26
 
     wrapped = textwrap.wrap(title, width=14)[:4]
     y = h - 40 - 46 * len(wrapped)
@@ -478,7 +482,7 @@ def _load_saved_podcasts() -> list:
             cover=make_cover(title, topic_label), status="ready",
         ))
 
-    podcasts.sort(key=lambda p: p.generated_date)
+    podcasts.sort(key=lambda p: p.generated_date, reverse=True)  # newest first (leftmost tile)
     return podcasts
 
 
@@ -589,7 +593,7 @@ def _start_generation(topic, blurb, company, podcasts):
 
     pid = uuid.uuid4().hex[:12]
     placeholder = _make_placeholder_podcast(pid, topic_label, company, company_name)
-    podcasts = podcasts + [placeholder]
+    podcasts = [placeholder] + podcasts  # newest first (leftmost tile), matching _load_saved_podcasts()
     pending = {"pid": pid, "user_input": user_input, "topic_label": topic_label}
 
     return (
@@ -644,10 +648,10 @@ def _loading_update(label):
 # --------------------------------------------------------------------------
 
 CUSTOM_CSS = """
-.gradio-container {background: #0d0e12 !important; padding-bottom: 110px;}
+.gradio-container {background: #0d0e12 !important; padding-bottom: 240px;}
 #app-title {color: #fff !important; font-weight: 800;}
 #app-subtitle {color: #d0d0d5 !important; margin-top: -0.75rem;}
-#app-subtitle p {font-style: italic; font-size: 12px; font-weight: 100;}
+#app-subtitle p {font-style: italic; font-size: 16px; font-weight: 100;}
 #section-title {color: #f2f2f2 !important; margin-top: 0.5rem;}
 
 /* ---- Tile ---- */
@@ -719,15 +723,32 @@ CUSTOM_CSS = """
 .fsp-carousel-btn { min-width: 40px !important; max-width: 40px !important; border-radius: 999px !important; }
 
 /* ---- Persistent bottom player ---- */
+/* pointer-events: none on the fixed wrapper lets clicks pass through its
+   transparent padding straight to whatever's underneath (e.g. the "Close
+   transcript" button) — only the actual player content re-enables them. */
 #fsp-player-bar {
     position: fixed !important;
     left: 0; right: 0; bottom: 0;
     z-index: 1000;
     padding: 10px 16px 16px 16px;
     background: linear-gradient(to top, #0d0e12 65%, transparent);
+    pointer-events: none;
 }
-#fsp-player-bar > * { max-width: 900px; margin-left: auto !important; margin-right: auto !important; }
-#fsp-stop-btn { max-width: 90px !important; flex: 0 0 auto !important; }
+#fsp-player-inner {
+    max-width: 900px; width: 100%;
+    margin-left: auto !important; margin-right: auto !important;
+    pointer-events: auto;
+}
+
+/* Same max-width/centering as #fsp-player-bar above, so the transcript's
+   edges line up with the player bar shown right below it. padding-bottom
+   guarantees the transcript's own last line always clears the fixed
+   player bar, regardless of what (if anything) follows it in the DOM. */
+#fsp-transcript-wrap {
+    max-width: 900px; margin-left: auto !important; margin-right: auto !important;
+    padding-bottom: 220px;
+}
+#fsp-close-transcript-btn { max-width: 60px !important; margin-left: auto !important; margin-bottom: 8px; }
 """
 
 CUSTOM_CSS += f"""
@@ -821,20 +842,31 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
                                 gr.Info("This episode is still being generated — check back shortly.")
                             else:
                                 gr.Info("This is a sample tile with no audio — generate a real episode to hear one.")
-                            return gr.update(), gr.update(), gr.update()
+                            return gr.update(), gr.update(), gr.update(), gr.update()
                         return (
                             gr.update(visible=True),
                             gr.update(value=podcast.audio_url, label=_player_label(podcast)),
-                            gr.update(value=podcast.script, visible=True),
+                            gr.update(visible=True),
+                            gr.update(value=podcast.script),
                         )
 
                     # show_api=False: Gradio 4.44.1's auto-generated API-docs
                     # schema crashes (TypeError in gradio_client's json-schema
                     # -> python-type conversion) for any event with gr.Audio
                     # as an output — this sidesteps that entirely.
-                    img.select(_play, outputs=[player_bar, player_audio, details], show_api=False)
+                    img.select(
+                        _play,
+                        outputs=[player_bar, player_audio, transcript_wrap, details],
+                        show_api=False,
+                    )
 
-        details = gr.Markdown(visible=False)
+        # Same elem_id-based max-width as #fsp-player-bar (see CUSTOM_CSS) so
+        # the transcript's left/right edges line up with the player above it.
+        with gr.Column(visible=False, elem_id="fsp-transcript-wrap") as transcript_wrap:
+            close_transcript_btn = gr.Button(
+                "✕", size="sm", elem_id="fsp-close-transcript-btn",
+            )
+            details = gr.Markdown()
         new_btn = gr.Button("+ New Podcast", variant="primary")
 
     # ---------------- Create view ----------------
@@ -871,12 +903,15 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
     # fixes the old "Cancel only closes the top half" bug: there is no
     # longer a "bottom half" tied to either view's visibility at all.
     with gr.Row(visible=False, elem_id="fsp-player-bar") as player_bar:
-        player_audio = gr.Audio(
-            visible=True, type="filepath", interactive=False,
-            autoplay=True, show_label=True, show_download_button=False,
-            show_share_button=False, elem_id="fsp-audio-player",
-        )
-        stop_btn = gr.Button("Stop", elem_id="fsp-stop-btn")
+        # Wrapped in its own Row (rather than constraining player_audio's
+        # width directly) so its max-width is centered the same way as
+        # #fsp-transcript-wrap's own max-width, keeping both aligned.
+        with gr.Row(elem_id="fsp-player-inner"):
+            player_audio = gr.Audio(
+                visible=True, type="filepath", interactive=False,
+                autoplay=True, show_label=True, show_download_button=False,
+                show_share_button=False, elem_id="fsp-audio-player",
+            )
 
     # Carries {"pid", "user_input", "topic_label"} from _start_generation to
     # _finish_generation (None when a generate request never actually
@@ -892,10 +927,19 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
               .then(go_to_home, outputs=[home_view, create_view]) \
               .then(lambda: gr.update(value="Cancel", interactive=True), outputs=[cancel_btn])
 
-    stop_btn.click(
-        lambda: (gr.update(visible=False), gr.update(value=None)),
-        outputs=[player_bar, player_audio],
-        show_api=False,  # see the img.select() comment above
+    # Closing the transcript also stops playback (no point leaving audio
+    # running with no visible player/transcript) and returns to the home
+    # view — closing is treated as "I'm done with this episode."
+    close_transcript_btn.click(
+        lambda: (
+            gr.update(visible=False),  # player_bar
+            gr.update(value=None),     # player_audio
+            gr.update(visible=False),  # transcript_wrap
+            gr.update(visible=True),   # home_view
+            gr.update(visible=False),  # create_view
+        ),
+        outputs=[player_bar, player_audio, transcript_wrap, home_view, create_view],
+        show_api=False,
     )
 
     # Two chained, non-generator .then() steps — not one generator function

@@ -5,7 +5,11 @@
       "Bash(mv /tmp/data_backup/* data/)",
       "Bash(python3 -c ' *)",
       "Bash(nohup python3 -c ' *)",
-      "Bash(pkill -f \"server_port=7862\" 2>/dev/null *)"
+      "Bash(pkill -f \"server_port=7862\" 2>/dev/null *)",
+      "Bash(pkill -f \"server_port=786\" 2>/dev/null *)",
+      "Bash(pkill -f \"podcast-studio/src/main.py\")",
+      "Bash(pkill -f \"run_local.py\")",
+      "Bash(rm -f /private/tmp/claude-501/-Users-muditairan-Desktop-Ironhack-Week2-Project-podcast-studio-podcast-studio/739027e5-8970-4483-afa5-55961b91222d/scratchpad/pw_check.py /private/tmp/claude-501/-Users-muditairan-Desktop-Ironhack-Week2-Project-podcast-studio-podcast-studio/739027e5-8970-4483-afa5-55961b91222d/scratchpad/check1.png /private/tmp/claude-501/-Users-muditairan-Desktop-Ironhack-Week2-Project-podcast-studio-podcast-studio/739027e5-8970-4483-afa5-55961b91222d/scratchpad/run_local.py /private/tmp/claude-501/-Users-muditairan-Desktop-Ironhack-Week2-Project-podcast-studio-podcast-studio/739027e5-8970-4483-afa5-55961b91222d/scratchpad/server*.log)"
     ],
     "additionalDirectories": [
       "/tmp"
