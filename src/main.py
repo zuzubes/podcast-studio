@@ -1,9 +1,12 @@
 """
 futuresignal.podcast — Gradio demo app
 
-A single-file Gradio application that mimics the Apple Podcasts "Top Shows"
-browsing experience, and lets a user spin up a new, personalised market
-podcast episode from a short brief.
+A single-file Gradio application that lets a user spin up a new, personalised market
+podcast episode from a short brief. 
+
+main.py - Main Application File
+Combines podcast generation orchestration and Gradio UI
+This is the entry point for the Podcast Studio application
 
 Run with:
     pip install gradio pillow
@@ -31,25 +34,6 @@ in-memory `podcasts_state` for this demo. A real deployment would also
 persist the Podcast records themselves (DB / JSON file) so history
 survives a server restart — out of scope here.
 
-NOTE ON THE TILE GRID / CAROUSEL
----------------------------------
-Tiles are NOT a gr.Gallery. gr.Gallery only supports a single plain-text
-caption per item, which isn't enough to reproduce the Apple Podcasts tile
-(cover art, title, "Created on ..." line, keyword tags). Instead the tile
-grid is built with `@gr.render(inputs=[podcasts_state])`: it re-runs
-whenever podcasts_state changes (i.e. right after a new episode is
-generated) and rebuilds exactly one tile per podcast — no fixed slot
-count, no show/hide padding. MAX_TILES is just a soft cap on how many
-episodes this demo grid will hold, not a pre-allocated component count.
-
-All tiles live in a single gr.Row with CSS `overflow-x: auto` +
-`scroll-snap-type: x mandatory` (see `.fsp-carousel-track` below), which
-turns it into a native, dependency-free horizontal carousel — no JS
-carousel library needed. SLIDES_PER_VIEW controls how many tiles are
-visible at once (their width is computed from it via CSS calc()); the
-Prev/Next buttons are plain Gradio buttons whose clicks are intercepted
-client-side (see HEAD_SCRIPT) to scroll the track by one tile — no server
-round-trip.
 """
 
 import base64
@@ -60,11 +44,25 @@ import struct
 import textwrap
 import uuid
 import wave
+import os
+import uuid
+import json
+
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from typing import Dict, Optional
+from pathlib import Path
+
 import gradio as gr
 from PIL import Image, ImageDraw, ImageFont
+
+
+
+# Import all modules
+from data_processor import DataProcessor
+from llm_processor import LLMProcessor
+from tts_generator import TTSGenerator
 
 # --------------------------------------------------------------------------
 # Static config
