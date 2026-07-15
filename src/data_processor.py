@@ -1,18 +1,21 @@
 """
 data_processor.py — Alpha Vantage data layer (Jay's block)
 
-Responsibility: given a user-selected topic + ticker, fetch news from
-Alpha Vantage, extract only articles relevant to that ticker, rank by
-combined relevance, and return:
-  - a detailed view (all fields) for internal QA
-  - a lean text block (title + sentiment + summary) for Vittal's LLM step
+v2 changes, per group feedback:
+  - No longer computes our own combined-relevance sort. We now ask
+    Alpha Vantage to sort by relevance itself (sort=RELEVANCE) and trust
+    its ordering directly.
+  - Reduced from top 10 to top 5 articles.
+  - The Vittal-facing output is now JSON (a list of 5 objects, each with
+    "summary" and "overall_sentiment_label"), not plain text.
+  - The detailed QA view stays plain text, for Jay's own eyes only.
 
 NO LLM calls happen in this file.
 """
 
 import os
+import json
 import requests
-from datetime import datetime
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
@@ -24,20 +27,17 @@ API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
 
 @dataclass
 class Article:
-    """One news article, reshaped from Alpha Vantage's raw JSON, scoped
-    to the specific topic + ticker the user selected."""
+    """One news article, reshaped from Alpha Vantage's raw JSON."""
     title: str
     summary: str
     source: str
     url: str
-    time_published: str            # raw AV format: "20260715T083152"
+    time_published: str
 
     overall_sentiment_score: float
     overall_sentiment_label: str
 
-    topic_relevance_score: float   # relevance to the user's chosen TOPIC
-    ticker_relevance_score: float  # relevance to the user's chosen TICKER
-    ticker_sentiment_score: float  # sentiment specifically about that ticker
+    ticker_sentiment_score: float
     ticker_sentiment_label: str
 
 
@@ -47,15 +47,19 @@ class AlphaVantageError(Exception):
     pass
 
 
-def fetch_news_sentiment(ticker: str, topic: str) -> dict:
+def fetch_news_sentiment(ticker: str, topic: str, limit: int = 5) -> dict:
     """
-    Calls Alpha Vantage NEWS_SENTIMENT with both a ticker and a topic in
-    ONE request. Returns the raw JSON response as a dict.
+    Calls Alpha Vantage NEWS_SENTIMENT with ticker + topic, asking Alpha
+    Vantage itself to sort by relevance and cap results at `limit`. We no
+    longer compute our own relevance ranking — this trusts AV's own
+    sort=RELEVANCE ordering directly, per group decision.
     """
     params = {
         "function": "NEWS_SENTIMENT",
         "tickers": ticker,
         "topics": topic,
+        "sort": "RELEVANCE",
+        "limit": limit,
         "apikey": API_KEY,
     }
 
@@ -77,28 +81,23 @@ def fetch_news_sentiment(ticker: str, topic: str) -> dict:
     return data
 
 
-def extract_articles(raw_response: dict, ticker: str, topic: str) -> list[Article]:
+def extract_articles(raw_response: dict, ticker: str) -> list[Article]:
     """
-    Reshapes each raw feed item into an Article, scoped to the specific
-    ticker and topic the user chose. Skips any article that doesn't
-    actually carry ticker-specific data.
+    Reshapes each raw feed item into an Article. Alpha Vantage has already
+    sorted and limited the results for us (via sort=RELEVANCE&limit=5), so
+    this function preserves that order — it does NOT re-sort anything.
+
+    Still defensively skips any article missing ticker-specific data,
+    since that's a data-integrity check, not a ranking decision.
     """
     articles = []
 
     for item in raw_response.get("feed", []):
-        topic_relevance = 0.0
-        for t in item.get("topics", []):
-            if t.get("topic") == topic:
-                topic_relevance = float(t.get("relevance_score", 0.0))
-                break
-
-        ticker_relevance = 0.0
         ticker_sentiment_score = 0.0
         ticker_sentiment_label = "Neutral"
         ticker_found = False
         for ts in item.get("ticker_sentiment", []):
             if ts.get("ticker") == ticker:
-                ticker_relevance = float(ts.get("relevance_score", 0.0))
                 ticker_sentiment_score = float(ts.get("ticker_sentiment_score", 0.0))
                 ticker_sentiment_label = ts.get("ticker_sentiment_label", "Neutral")
                 ticker_found = True
@@ -116,8 +115,6 @@ def extract_articles(raw_response: dict, ticker: str, topic: str) -> list[Articl
                 time_published=item.get("time_published", ""),
                 overall_sentiment_score=item.get("overall_sentiment_score", 0.0),
                 overall_sentiment_label=item.get("overall_sentiment_label", "Neutral"),
-                topic_relevance_score=topic_relevance,
-                ticker_relevance_score=ticker_relevance,
                 ticker_sentiment_score=ticker_sentiment_score,
                 ticker_sentiment_label=ticker_sentiment_label,
             )
@@ -126,28 +123,9 @@ def extract_articles(raw_response: dict, ticker: str, topic: str) -> list[Articl
     return articles
 
 
-def parse_av_timestamp(raw: str) -> datetime:
-    """Alpha Vantage timestamps look like '20260715T083152'."""
-    return datetime.strptime(raw, "%Y%m%dT%H%M%S")
-
-
-def get_top_articles(articles: list[Article], top_n: int = 10) -> list[Article]:
-    """
-    Ranks articles by combined relevance (topic + ticker), using recency
-    as the tie-breaker, then returns the top N.
-    """
-    def sort_key(article: Article):
-        combined_relevance = article.topic_relevance_score + article.ticker_relevance_score
-        published_dt = parse_av_timestamp(article.time_published)
-        return (-combined_relevance, -published_dt.timestamp())
-
-    ranked = sorted(articles, key=sort_key)
-    return ranked[:top_n]
-
-
 def format_articles_detailed(articles: list[Article]) -> str:
     """
-    Full detail view — every field, for internal QA/review only.
+    Full detail view — every field, for Jay's own QA/review only.
     NOT what gets handed to Vittal.
     """
     blocks = []
@@ -157,8 +135,6 @@ def format_articles_detailed(articles: list[Article]) -> str:
             f"Title: {a.title}\n"
             f"Source: {a.source}\n"
             f"Published: {a.time_published}\n"
-            f"Topic relevance: {a.topic_relevance_score:.3f}\n"
-            f"Ticker relevance: {a.ticker_relevance_score:.3f}\n"
             f"Overall sentiment: {a.overall_sentiment_label} ({a.overall_sentiment_score:.3f})\n"
             f"Ticker sentiment: {a.ticker_sentiment_label} ({a.ticker_sentiment_score:.3f})\n"
             f"URL: {a.url}\n"
@@ -168,35 +144,37 @@ def format_articles_detailed(articles: list[Article]) -> str:
     return "\n---\n".join(blocks)
 
 
-def format_articles_for_llm(articles: list[Article]) -> str:
+def format_articles_json(articles: list[Article]) -> str:
     """
-    Lean handoff for Vittal — title, ticker sentiment label, and summary
-    per article. Enough context for tone, without noise that doesn't
-    help a podcast script (relevance scores, raw sentiment floats, dates).
+    Vittal-facing output. A JSON string: a list of objects, each with
+    "summary" and "overall_sentiment_label" — exactly as requested.
+
+    NOTE: this uses the ARTICLE's overall sentiment, not the ticker-
+    specific sentiment, per the group's explicit field name request.
     """
-    blocks = []
-    for i, a in enumerate(articles, start=1):
-        block = (
-            f"Article {i}: {a.title}\n"
-            f"Sentiment: {a.ticker_sentiment_label}\n"
-            f"Summary: {a.summary}\n"
-        )
-        blocks.append(block)
-    return "\n---\n".join(blocks)
+    payload = [
+        {
+            "summary": a.summary,
+            "overall_sentiment_label": a.overall_sentiment_label,
+        }
+        for a in articles
+    ]
+    return json.dumps(payload, indent=2)
 
 
-def get_articles_for_podcast(ticker: str, topic: str, top_n: int = 10) -> str:
+def get_articles_for_podcast(ticker: str, topic: str, top_n: int = 5) -> str:
     """
     Public entry point — the function Vittal imports and calls.
-    Returns the lean, formatted text block, ready for his LLM prompt.
+    Returns a JSON string: a list of up to `top_n` objects, each with
+    "summary" and "overall_sentiment_label".
 
     Example:
-        summary_text = get_articles_for_podcast("GS", "earnings")
+        summary_json = get_articles_for_podcast("GS", "earnings")
     """
-    raw = fetch_news_sentiment(ticker, topic)
-    all_articles = extract_articles(raw, ticker, topic)
-    top_articles = get_top_articles(all_articles, top_n)
-    return format_articles_for_llm(top_articles)
+    raw = fetch_news_sentiment(ticker, topic, limit=top_n)
+    articles = extract_articles(raw, ticker)
+    articles = articles[:top_n]
+    return format_articles_json(articles)
 
 
 # ---------- Quick manual test ----------
@@ -205,21 +183,19 @@ if __name__ == "__main__":
     test_topic = "earnings"
 
     try:
-        # Fetch and process ONCE — reuse the same data for both views
-        # below, so this test only spends 1 API call, not 2.
-        raw = fetch_news_sentiment(test_ticker, test_topic)
-        all_articles = extract_articles(raw, test_ticker, test_topic)
-        top_articles = get_top_articles(all_articles, top_n=10)
+        raw = fetch_news_sentiment(test_ticker, test_topic, limit=5)
+        articles = extract_articles(raw, test_ticker)
+        articles = articles[:5]
 
         print("=" * 60)
         print("DETAILED VIEW (for QA — not what Vittal receives)")
         print("=" * 60)
-        print(format_articles_detailed(top_articles))
+        print(format_articles_detailed(articles))
 
         print("\n" + "=" * 60)
-        print("LEAN VIEW (this is what Vittal receives)")
+        print("JSON VIEW (this is what Vittal receives)")
         print("=" * 60)
-        print(format_articles_for_llm(top_articles))
+        print(format_articles_json(articles))
 
     except AlphaVantageError as e:
         print(f"Alpha Vantage error: {e}")
