@@ -536,7 +536,7 @@ CUSTOM_CSS = """
 .gradio-container {background: #0d0e12 !important; padding-bottom: 110px;}
 #app-title {color: #fff !important; font-weight: 800;}
 #app-subtitle {color: #d0d0d5 !important; margin-top: -0.75rem;}
-#app-subtitle p {font-style: italic; font-size: 20px;}
+#app-subtitle p {font-style: italic; font-size: 12px; font-weight: 100;}
 #section-title {color: #f2f2f2 !important; margin-top: 0.5rem;}
 
 /* ---- Tile ---- */
