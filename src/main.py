@@ -51,6 +51,7 @@ from datetime import datetime
 
 from typing import Dict, Optional
 from pathlib import Path
+from urllib.parse import quote
 
 import gradio as gr
 from PIL import Image, ImageDraw, ImageFont
@@ -62,9 +63,9 @@ from data_processor import (
     get_articles_for_podcast,
     AlphaVantageError,
     fetch_news_sentiment,  # For debugging/detailed logging
-)    
-#from llm_processor import LLMProcessor
-#from tts_generator import TTSGenerator
+)
+from llm_processor import summarize_articles, generate_podcast_metadata, save_script
+from tts_generator import generate_audio
 
 # --------------------------------------------------------------------------
 # Static config
@@ -210,6 +211,7 @@ class Podcast:
     podcast_title: str
     podcast_keywords: list
     cover: Image.Image = field(default=None, repr=False, compare=False)
+    status: str = "ready"  # "ready" | "generating" | "error" — drives tile rendering
 
 
 def _format_date(dt: datetime) -> str:
@@ -276,7 +278,8 @@ def _write_placeholder_audio(podcast_id: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# Episode construction - Need to figure this out. How to call Vittal's LLM and TTS modules
+# Episode construction — mock generator, used only for the seed/demo tiles
+# (see _run_generation_pipeline() below for the real data -> LLM -> TTS path)
 # --------------------------------------------------------------------------
 
 def _build_podcast(title, industry, blurb, keywords, sources_used=None, company="") -> Podcast:
@@ -314,6 +317,103 @@ def _mock_title(topic_label: str, company: str) -> str:
     if company:
         return f"{company}: {topic_label}"
     return f"{topic_label}: Market Signal"
+
+
+# --------------------------------------------------------------------------
+# Real episode generation: data_processor (Alpha Vantage) -> llm_processor
+# (script + tile metadata) -> tts_generator (audio). This is the pipeline
+# that generate_episode() below kicks off once the user clicks "Generate".
+# --------------------------------------------------------------------------
+
+class PodcastGenerationError(Exception):
+    """Raised when a step of the real generation pipeline fails hard enough
+    that no usable episode can be produced (as opposed to a soft/partial
+    failure like a missing data source, which is logged as a warning and
+    passed through to the LLM as a `fetch_errors` gap instead)."""
+    pass
+
+
+def _make_placeholder_podcast(pid: str, topic_label: str, company: str, company_name: str) -> Podcast:
+    """A 'generating…' tile shown on the home screen immediately after the
+    user clicks Generate, while the real pipeline runs in the background of
+    the same request (see the generator-based generate_episode() below)."""
+    title = _mock_title(topic_label, company_name or company)
+    cover = make_cover(title, topic_label)
+    return Podcast(
+        id=pid, industry=topic_label, generated_date=datetime.now(),
+        script="", audio_url="", sources_used=[],
+        podcast_title=title, podcast_keywords=[], cover=cover,
+        status="generating",
+    )
+
+
+def _run_generation_pipeline(user_input: dict, topic_label: str, pid: str) -> tuple[Podcast, list]:
+    """Runs the full pipeline for one podcast request and returns the
+    finished Podcast plus a list of user-facing warning strings (e.g. a data
+    source that failed but didn't block generation).
+
+    Steps: persist the request -> fetch news sentiment (Alpha Vantage) ->
+    generate the spoken script (LLM) -> derive tile metadata (LLM) -> save
+    the script -> synthesize audio (TTS).
+    """
+    warnings = []
+
+    # Persist the user's request as JSON — the shared contract data_processor
+    # and llm_processor read from/write alongside (see llm_processor.
+    # load_request_config for the on-disk shape this mirrors).
+    request_path = DATA_DIR / f"{pid}_request.json"
+    with open(request_path, "w") as f:
+        json.dump(user_input, f, indent=2)
+
+    # --- data_processor: Alpha Vantage news + sentiment, sorted by relevance ---
+    fetch_errors = {}
+    news_sentiment = []
+    try:
+        articles_json = get_articles_for_podcast(user_input["ticker"], user_input["topic"])
+        news_sentiment = json.loads(articles_json)
+    except AlphaVantageError as e:
+        fetch_errors["alpha_vantage"] = str(e)
+        warnings.append(f"Live news data unavailable ({e}) — the episode will note the gap.")
+
+    # --- llm_processor: spoken script from the data feed + user's brief ---
+    try:
+        script = summarize_articles(
+            user_input["ticker"], user_input["topic"], user_input["company"]["name"],
+            user_input["user_prompt"], news_sentiment, fetch_errors=fetch_errors,
+        )
+    except Exception as e:
+        raise PodcastGenerationError(f"Script generation failed: {e}") from e
+
+    # --- llm_processor: title + 3 tags for the home-screen tile ---
+    try:
+        title, tags = generate_podcast_metadata(
+            script, user_input["ticker"], user_input["topic"], user_input["company"]["name"],
+        )
+    except Exception:
+        title = _mock_title(topic_label, user_input["ticker"])
+        tags = TOPIC_KEYWORDS.get(user_input["topic"], [topic_label])[:3]
+        warnings.append("Couldn't auto-generate a title/tags for this episode — used defaults instead.")
+
+    # --- tts_generator: script text -> narrated audio file ---
+    try:
+        script_path = save_script(
+            user_input["ticker"], user_input["topic"], user_input["company"]["name"],
+            user_input["user_prompt"], script, output_dir=str(DATA_DIR),
+        )
+        audio_path = generate_audio(script_path, output_dir=str(DATA_DIR))
+    except Exception as e:
+        raise PodcastGenerationError(f"Audio generation failed: {e}") from e
+
+    cover = make_cover(title, topic_label)
+    entry = Podcast(
+        id=pid, industry=topic_label, generated_date=datetime.now(),
+        script=script, audio_url=audio_path,
+        sources_used=["Alpha Vantage news sentiment"] if news_sentiment else [],
+        podcast_title=title, podcast_keywords=(tags or [topic_label])[:3],
+        cover=cover, status="ready",
+    )
+    return entry, warnings
+
 
 # --------------------------------------------------------------------------
 # Seed data — a few "New Shows" so the home screen isn't empty on first load
@@ -354,10 +454,17 @@ def _seed_podcasts():
 
 
 # --------------------------------------------------------------------------
-# Tile caption (title, "Created on ..." line, keyword tags) - Output of TTS from Vittal to be used here
+# Tile caption (title, "Created on ..." line, keyword tags)
 # --------------------------------------------------------------------------
 
 def _tile_caption(p: Podcast) -> str:
+    if p.status == "generating":
+        return (
+            f'<div class="fsp-tile-cap">'
+            f'<div class="fsp-tile-title">{p.podcast_title}</div>'
+            f'<div class="fsp-tile-updated fsp-tile-generating">Generating…</div>'
+            f'</div>'
+        )
     tags_html = "".join(
         f'<span class="fsp-tile-tag">{kw}</span>' for kw in p.podcast_keywords[:3]
     )
@@ -380,13 +487,15 @@ def make_player_html(podcast: Podcast) -> str:
     (#fsp-player-bar, see CUSTOM_CSS) so it behaves like a persistent
     bottom player.
 
-    Play/pause and the volume slider are purely client-side toggles (see
-    the delegated click handler in HEAD_SCRIPT) — this demo has no real
-    audio engine wired up (audio_url is a placeholder silent .wav), so
-    there's no playback state to actually control yet.
+    The bar's controls are custom HTML/CSS (not gr.Audio) so they match the
+    app's look; a real hidden <audio> tag drives actual playback, wired up
+    by the delegated click handler in HEAD_SCRIPT. Its `src` uses Gradio's
+    `/file=` route, which requires the episode's directory to be in
+    `allowed_paths` on `demo.launch()` (see bottom of this file).
     """
     title = podcast.podcast_title
     date = _format_date(podcast.generated_date)
+    audio_src = quote(str(Path(podcast.audio_url).resolve())) if podcast.audio_url else ""
 
     return f"""
     <style>
@@ -430,6 +539,7 @@ def make_player_html(podcast: Podcast) -> str:
     }}
     </style>
 
+    <audio id="fsp-audio" src="/file={audio_src}" preload="none"></audio>
     <div class="fsp-player">
         <div class="fsp-controls">
             <span class="fsp-speed">2x</span>
@@ -467,7 +577,7 @@ def make_player_html(podcast: Podcast) -> str:
 
 
 # --------------------------------------------------------------------------
-# Episode generation (mock)
+# Episode generation
 # --------------------------------------------------------------------------
 
 def _reset_gen_btn():
@@ -475,60 +585,87 @@ def _reset_gen_btn():
 
 
 def generate_episode(topic, blurb, company, podcasts):
+    """Generator: yields once immediately to send the user home with a
+    'Generating…' placeholder tile, keeps running the real pipeline, then
+    yields again to swap that tile for the finished episode (or drop it and
+    warn, on a hard failure). Gradio streams each yield to the browser as
+    it happens, so the UI updates live across a single event handler call.
+    """
     # --- validation ---------------------------------------------------
     # Uses gr.Warning (a toast that does NOT halt execution) instead of
-    # gr.Error, so we can still return a full no-op output tuple that
+    # gr.Error, so we can still yield a full no-op output tuple that
     # resets the "Generating…" button back to normal. Raising gr.Error
     # here would abort the .then() chain and leave the button stuck.
     common_noop = (gr.update(), gr.update(), gr.update(), gr.update(),
                    gr.update(), gr.update(), gr.update())
 
+    word_count = len((blurb or "").split())
+
     if not topic:
         gr.Warning("Please choose a topic.")
-        return (podcasts, *common_noop, _reset_gen_btn())
+        yield (podcasts, *common_noop, _reset_gen_btn())
+        return
+    if not company or not company.strip():
+        gr.Warning("Please choose a company or ticker.")
+        yield (podcasts, *common_noop, _reset_gen_btn())
+        return
     if not blurb or not blurb.strip():
-        gr.Warning("The context is mandatory — please add a few sentences to help us understand your needs.")
-        return (podcasts, *common_noop, _reset_gen_btn())
-    if len(blurb) > 200:
-        gr.Warning(f"Prompt is {len(blurb)} characters — please trim to 200 or fewer.")
-        return (podcasts, *common_noop, _reset_gen_btn())
+        gr.Warning("The context is mandatory — please add a few words to help us understand your needs.")
+        yield (podcasts, *common_noop, _reset_gen_btn())
+        return
+    if word_count > 20:
+        gr.Warning(f"Prompt is {word_count} words — please trim to 20 or fewer.")
+        yield (podcasts, *common_noop, _reset_gen_btn())
+        return
     if len(podcasts) >= MAX_TILES:
         gr.Warning(f"Demo grid is capped at {MAX_TILES} podcasts — raise MAX_TILES to allow more.")
-        return (podcasts, *common_noop, _reset_gen_btn())
+        yield (podcasts, *common_noop, _reset_gen_btn())
+        return
 
     topic_label = TOPIC_LABELS.get(topic, topic)
-    company = (company or "").strip()
-    keywords = TOPIC_KEYWORDS.get(topic, [topic_label])[:3]
-    title = _mock_title(topic_label, company)
+    company = company.strip()
+    company_name = COMPANY_NAMES.get(company, company)
 
     user_input = {
         "ticker": company,
         "topic": topic,
-        "company": {"name": COMPANY_NAMES.get(company, company)},
+        "company": {"name": company_name},
         "user_prompt": blurb.strip(),
     }
 
-    # ---------------------------------
-    # change here for Jay's Data module
-    # ---------------------------------
-    entry = _build_podcast(
-        title, topic_label, user_input["user_prompt"], keywords,
-        company=user_input["ticker"],
-    )
+    pid = uuid.uuid4().hex[:12]
+    placeholder = _make_placeholder_podcast(pid, topic_label, company, company_name)
+    podcasts = podcasts + [placeholder]
 
-    podcasts = podcasts + [entry]
-
-    return (
-        podcasts,               # state
+    # --- 1st yield: send the user home immediately with the "generating"
+    # tile in place; the pipeline below keeps running in this same call. ---
+    yield (
+        podcasts,                  # state
         gr.update(visible=True),   # home_view
         gr.update(visible=False),  # create_view
-        gr.update(value=make_player_html(entry), visible=True),  # player_bar
-        gr.update(value=entry.script, visible=True),  # details
-        gr.update(value=None),   # reset topic
-        gr.update(value=""),     # reset blurb
-        gr.update(value=None),   # reset company
+        gr.update(),               # player_bar unchanged
+        gr.update(),               # details unchanged
+        gr.update(value=None),     # reset topic
+        gr.update(value=""),       # reset blurb
+        gr.update(value=None),     # reset company
         _reset_gen_btn(),
     )
+
+    try:
+        entry, pipeline_warnings = _run_generation_pipeline(user_input, topic_label, pid)
+    except PodcastGenerationError as e:
+        gr.Warning(f"Couldn't generate this episode: {e}")
+        podcasts = [p for p in podcasts if p.id != pid]
+        yield (podcasts, *common_noop, gr.update())
+        return
+
+    for w in pipeline_warnings:
+        gr.Warning(w)
+
+    podcasts = [entry if p.id == pid else p for p in podcasts]
+
+    # --- 2nd yield: swap the placeholder tile for the finished episode. ---
+    yield (podcasts, *common_noop, gr.update())
 
 
 def go_to_create():
@@ -598,6 +735,8 @@ CUSTOM_CSS = """
     background: #1c1c1e; color: #d0d0d5; font-size: 11px;
     padding: 4px 10px; border-radius: 999px; white-space: nowrap;
 }
+.fsp-tile-generating { color: #a48dfc; animation: fsp-pulse 1.4s ease-in-out infinite; }
+@keyframes fsp-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
 /* ---- Carousel: plain CSS scroll-snap, no JS library ---- */
 .fsp-carousel-track {
@@ -637,6 +776,17 @@ CUSTOM_CSS += f"""
 # would otherwise wipe the listeners we attached once.
 HEAD_SCRIPT = """
 <script>
+function fspSyncPlayIcon(playing) {
+  const playBtn = document.querySelector('.fsp-play');
+  if (!playBtn) return;
+  playBtn.dataset.playing = playing ? 'true' : 'false';
+  playBtn.title = playing ? 'Pause' : 'Play';
+  const playIcon = playBtn.querySelector('.fsp-icon-play');
+  const pauseIcon = playBtn.querySelector('.fsp-icon-pause');
+  if (playIcon) playIcon.style.display = playing ? 'none' : '';
+  if (pauseIcon) pauseIcon.style.display = playing ? '' : 'none';
+}
+
 function fspTick() {
   const track = document.querySelector('.fsp-carousel-track');
   const prev = document.getElementById('fsp-carousel-prev');
@@ -653,6 +803,26 @@ function fspTick() {
     next.dataset.fspBound = "1";
     next.addEventListener('click', (e) => { e.preventDefault(); track.scrollBy({left: step(), behavior: 'smooth'}); });
   }
+
+  // #fsp-audio's inner HTML (and the <audio> tag itself) is replaced
+  // wholesale each time a new episode starts playing, so we (re)bind its
+  // play/pause/ended events every tick rather than once on document.
+  const audio = document.getElementById('fsp-audio');
+  if (audio && !audio.dataset.fspBound) {
+    audio.dataset.fspBound = "1";
+    audio.volume = 0.8;
+    audio.addEventListener('play', () => fspSyncPlayIcon(true));
+    audio.addEventListener('pause', () => fspSyncPlayIcon(false));
+    audio.addEventListener('ended', () => fspSyncPlayIcon(false));
+  }
+  const volumeRange = document.querySelector('.fsp-volume-range');
+  if (volumeRange && !volumeRange.dataset.fspBound) {
+    volumeRange.dataset.fspBound = "1";
+    volumeRange.addEventListener('input', () => {
+      const a = document.getElementById('fsp-audio');
+      if (a) a.volume = Number(volumeRange.value) / 100;
+    });
+  }
 }
 setInterval(fspTick, 800);
 
@@ -665,13 +835,10 @@ setInterval(fspTick, 800);
 document.addEventListener('click', (e) => {
   const playBtn = e.target.closest('.fsp-play');
   if (playBtn) {
-    const nowPlaying = playBtn.dataset.playing !== 'true';
-    playBtn.dataset.playing = nowPlaying ? 'true' : 'false';
-    playBtn.title = nowPlaying ? 'Pause' : 'Play';
-    const playIcon = playBtn.querySelector('.fsp-icon-play');
-    const pauseIcon = playBtn.querySelector('.fsp-icon-pause');
-    if (playIcon) playIcon.style.display = nowPlaying ? 'none' : '';
-    if (pauseIcon) pauseIcon.style.display = nowPlaying ? '' : 'none';
+    const audio = document.getElementById('fsp-audio');
+    if (audio && audio.getAttribute('src')) {
+      if (audio.paused) { audio.play().catch(() => {}); } else { audio.pause(); }
+    }
     return;
   }
   const volBtn = e.target.closest('.fsp-volume-btn');
@@ -732,6 +899,9 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
                     # podcast instead of whatever `p` is by the time it's
                     # actually clicked (the classic loop-closure pitfall).
                     def _play(podcast=p):
+                        if podcast.status != "ready":
+                            gr.Info("This episode is still being generated — check back shortly.")
+                            return gr.update(), gr.update()
                         return (
                             gr.update(value=make_player_html(podcast), visible=True),
                             gr.update(value=podcast.script, visible=True),
@@ -760,11 +930,9 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
         )
         blurb = gr.Textbox(
             label="Share your context on intent, markets, news that brought you here",
-            info="Describe the context and intent behind your podcast idea",
-            max_length=200,
+            info="A few keywords or a short prompt on your motivation for this episode (max 20 words)",
             lines=4,
-            placeholder="e.g. Focused on US mid-cap industrials, looking to rotate "
-                        "out of cash over the next 2 quarters amid rate-cut expectations...",
+            placeholder="e.g. Rotating out of cash into mid-cap industrials amid rate-cut expectations",
         )
 
         with gr.Row():
@@ -804,4 +972,7 @@ if __name__ == "__main__":
     # theme=/css=/head= live on the gr.Blocks(...) call above — this
     # gradio version (4.44.1) doesn't accept them on launch() (that's a
     # Gradio >= 6.0 signature).
-    demo.launch(share=True)
+    # allowed_paths lets the custom <audio src="/file=..."> tag in
+    # make_player_html() actually fetch generated/placeholder audio from
+    # DATA_DIR — Gradio blocks serving arbitrary local files otherwise.
+    demo.launch(share=True, allowed_paths=[str(DATA_DIR.resolve())])

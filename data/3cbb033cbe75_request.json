@@ -1,0 +1,8 @@
+{
+  "ticker": "NVDA",
+  "topic": "technology",
+  "company": {
+    "name": "Nvidia"
+  },
+  "user_prompt": "Should I invest here for near-mid term?"
+}
