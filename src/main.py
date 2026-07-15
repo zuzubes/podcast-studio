@@ -36,9 +36,7 @@ survives a server restart — out of scope here.
 
 """
 
-import base64
 import hashlib
-import io
 import pathlib
 import struct
 import textwrap
@@ -58,9 +56,13 @@ import gradio as gr
 from PIL import Image, ImageDraw, ImageFont
 
 
-
 # Import all modules
-from data_processor import DataProcessor
+
+from data_processor import (
+    get_articles_for_podcast,
+    AlphaVantageError,
+    fetch_news_sentiment,  # For debugging/detailed logging
+)    
 from llm_processor import LLMProcessor
 from tts_generator import TTSGenerator
 
@@ -79,6 +81,9 @@ TILE_GAP_PX = 16  # matches Gradio's default Row gap; used for the width calc()
 # src/data/.
 DATA_DIR = pathlib.Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+
 AUDIO_DURATION_SEC = 3
 AUDIO_FRAMERATE = 22050
 
@@ -191,7 +196,7 @@ PALETTES = [
 
 @dataclass
 class Podcast:
-    id: str                      # unique ID for history / audio filename
+    id: str                      # unique ID for history 
     industry: str
     generated_date: datetime
     script: str                  # full text script
@@ -252,13 +257,6 @@ def make_cover(title: str, tag: str) -> Image.Image:
     return img
 
 
-def _img_to_b64(img: Image.Image, size=(56, 56)) -> str:
-    thumb = img.copy().resize(size)
-    buf = io.BytesIO()
-    thumb.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode()
-
-
 def _write_placeholder_audio(podcast_id: str) -> str:
     """Write a few seconds of silence as a stand-in for real TTS narration
     (see NOTE ON GENERATION LOGIC at the top). Returns the file path."""
@@ -273,44 +271,44 @@ def _write_placeholder_audio(podcast_id: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# Episode construction
+# Episode construction - Need to figure this out. How to call Vittal's LLM and TTS modules
 # --------------------------------------------------------------------------
 
-def _build_podcast(title, industry, blurb, keywords, sources_used=None, company="") -> Podcast:
-    pid = uuid.uuid4().hex[:12]
-    cover = make_cover(title, industry)
-    now = datetime.now()
-    audio_url = _write_placeholder_audio(pid)
-    cold_open = (
-        f"1. Cold open — why {industry.lower()} matters right now, "
-        f"with a focus on {company}.\n" if company else
-        f"1. Cold open — why {industry.lower()} matters right now.\n"
-    )
-    script = (
-        f"**{title}**\n\n"
-        f"*Topic:* {industry}  \n"
-        f"*Company / Ticker:* {company or 'General market coverage'}  \n"
-        f"*Generated:* {now.strftime('%d %b %Y, %H:%M')}\n\n"
-        f"**Brief:** {blurb}\n\n"
-        "---\n"
-        "**Episode outline** *(mock script — wire up an LLM call here)*\n\n"
-        f"{cold_open}"
-        "2. Market backdrop tailored to the stated brief.\n"
-        "3. The case for and against, and what's already priced in.\n"
-        "4. Key risks and what would change the thesis.\n"
-        "5. Close — one thing to watch this week.\n"
-    )
-    return Podcast(
-        id=pid, industry=industry, generated_date=now,
-        script=script, audio_url=audio_url, sources_used=sources_used or [],
-        podcast_title=title, podcast_keywords=keywords[:3], cover=cover,
-    )
+# def _build_podcast(title, industry, blurb, keywords, sources_used=None, company="") -> Podcast:
+#     pid = uuid.uuid4().hex[:12]
+#     cover = make_cover(title, industry)
+#     now = datetime.now()
+#     audio_url = _write_placeholder_audio(pid)
+#     cold_open = (
+#         f"1. Cold open — why {industry.lower()} matters right now, "
+#         f"with a focus on {company}.\n" if company else
+#         f"1. Cold open — why {industry.lower()} matters right now.\n"
+#     )
+#     script = (
+#         f"**{title}**\n\n"
+#         f"*Topic:* {industry}  \n"
+#         f"*Company / Ticker:* {company or 'General market coverage'}  \n"
+#         f"*Generated:* {now.strftime('%d %b %Y, %H:%M')}\n\n"
+#         f"**Brief:** {blurb}\n\n"
+#         "---\n"
+#         "**Episode outline** *(mock script — wire up an LLM call here)*\n\n"
+#         f"{cold_open}"
+#         "2. Market backdrop tailored to the stated brief.\n"
+#         "3. The case for and against, and what's already priced in.\n"
+#         "4. Key risks and what would change the thesis.\n"
+#         "5. Close — one thing to watch this week.\n"
+#     )
+#     return Podcast(
+#         id=pid, industry=industry, generated_date=now,
+#         script=script, audio_url=audio_url, sources_used=sources_used or [],
+#         podcast_title=title, podcast_keywords=keywords[:3], cover=cover,
+#     )
 
 
-def _mock_title(topic_label: str, company: str) -> str:
-    if company:
-        return f"{company}: {topic_label}"
-    return f"{topic_label}: Market Signal"
+# def _mock_title(topic_label: str, company: str) -> str:
+#     if company:
+#         return f"{company}: {topic_label}"
+#     return f"{topic_label}: Market Signal"
 
 # --------------------------------------------------------------------------
 # Seed data — a few "New Shows" so the home screen isn't empty on first load
@@ -351,7 +349,7 @@ def _seed_podcasts():
 
 
 # --------------------------------------------------------------------------
-# Tile caption (title, "Created on ..." line, keyword tags)
+# Tile caption (title, "Created on ..." line, keyword tags) - Output of TTS from Vittal to be used here
 # --------------------------------------------------------------------------
 
 def _tile_caption(p: Podcast) -> str:
@@ -372,110 +370,92 @@ def _tile_caption(p: Podcast) -> str:
 # --------------------------------------------------------------------------
 
 def make_player_html(podcast: Podcast) -> str:
-    """Build a mini-player bar in the style of the Apple Podcasts player:
-    speed, -15s, play, +30s, sleep timer | cover + title/date + scrubber |
-    transcript, queue, cast, volume. The overflow ("...") menu is omitted
-    on purpose. Rendered inside a fixed-position wrapper (#fsp-player-bar,
-    see CUSTOM_CSS) so it behaves like a persistent bottom player.
+    """Build a mini-player bar: speed, play/pause | title/date | volume
+    (with an expandable slider). Rendered inside a fixed-position wrapper
+    (#fsp-player-bar, see CUSTOM_CSS) so it behaves like a persistent
+    bottom player.
+
+    Play/pause and the volume slider are purely client-side toggles (see
+    the delegated click handler in HEAD_SCRIPT) — this demo has no real
+    audio engine wired up (audio_url is a placeholder silent .wav), so
+    there's no playback state to actually control yet.
     """
-    thumb_b64 = _img_to_b64(podcast.cover)
     title = podcast.podcast_title
     date = _format_date(podcast.generated_date)
 
     return f"""
     <style>
     .fsp-player {{
-        display: flex; align-items: center; gap: 18px;
+        display: flex; align-items: center; gap: 14px;
         background: #1c1c1e; border-radius: 999px;
-        padding: 10px 20px; margin: 14px 0 6px 0;
+        padding: 8px 16px; margin: 14px 0 6px 0;
         font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
         box-shadow: 0 4px 18px rgba(0,0,0,0.35);
     }}
-    .fsp-controls {{ display: flex; align-items: center; gap: 14px; flex-shrink: 0; }}
-    .fsp-speed {{ color: #a48dfc; font-weight: 700; font-size: 15px; width: 26px; }}
+    .fsp-controls {{ display: flex; align-items: center; gap: 10px; flex-shrink: 0; }}
+    .fsp-speed {{ color: #a48dfc; font-weight: 700; font-size: 13px; width: 20px; }}
     .fsp-icon-btn {{ background: none; border: none; padding: 0; cursor: pointer;
                       color: #f2f2f2; display: flex; align-items: center; }}
-    .fsp-icon-btn svg {{ width: 22px; height: 22px; }}
-    .fsp-play {{ background: #f2f2f2; border-radius: 50%; width: 34px; height: 34px;
+    .fsp-icon-btn svg {{ width: 16px; height: 16px; }}
+    .fsp-play {{ background: #f2f2f2; border-radius: 50%; width: 26px; height: 26px;
                  display: flex; align-items: center; justify-content: center; }}
-    .fsp-play svg {{ width: 15px; height: 15px; margin-left: 2px; }}
-    .fsp-meta {{ display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }}
-    .fsp-thumb {{ width: 44px; height: 44px; border-radius: 8px; object-fit: cover; flex-shrink: 0; }}
-    .fsp-text {{ min-width: 0; }}
-    .fsp-title {{ color: #f5f5f5; font-weight: 700; font-size: 14px;
+    .fsp-play svg {{ width: 11px; height: 11px; }}
+    .fsp-play .fsp-icon-play {{ margin-left: 1px; }}
+    .fsp-meta {{ flex: 1; min-width: 0; }}
+    .fsp-title {{ color: #f5f5f5; font-weight: 700; font-size: 13px;
                   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-    .fsp-date {{ color: #9a9a9e; font-size: 12px; margin-top: 2px; }}
-    .fsp-scrub {{ height: 3px; background: #45454a; border-radius: 2px; margin-top: 6px; }}
-    .fsp-scrub-fill {{ height: 3px; width: 12%; background: #d8d8db; border-radius: 2px; }}
-    .fsp-right {{ display: flex; align-items: center; gap: 16px; flex-shrink: 0; }}
+    .fsp-date {{ color: #9a9a9e; font-size: 11px; margin-top: 2px; }}
+    .fsp-right {{ display: flex; align-items: center; gap: 10px; flex-shrink: 0; }}
+    .fsp-volume-wrap {{ display: flex; align-items: center; gap: 8px; }}
+    .fsp-volume-pop {{
+        max-width: 0; opacity: 0; overflow: hidden;
+        transition: max-width 0.2s ease, opacity 0.2s ease;
+    }}
+    .fsp-volume-pop.fsp-open {{ max-width: 100px; opacity: 1; }}
+    .fsp-volume-range {{
+        width: 90px; height: 3px; -webkit-appearance: none; appearance: none;
+        background: #45454a; border-radius: 2px; outline: none;
+    }}
+    .fsp-volume-range::-webkit-slider-thumb {{
+        -webkit-appearance: none; appearance: none;
+        width: 11px; height: 11px; border-radius: 50%; background: #fff; cursor: pointer;
+    }}
+    .fsp-volume-range::-moz-range-thumb {{
+        width: 11px; height: 11px; border-radius: 50%; background: #fff; border: none; cursor: pointer;
+    }}
     </style>
 
     <div class="fsp-player">
         <div class="fsp-controls">
             <span class="fsp-speed">2x</span>
-            <button class="fsp-icon-btn" title="Back 15 seconds">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-                    <path d="M4 12a8 8 0 1 1 2.6 5.9" stroke-linecap="round"/>
-                    <path d="M4 12V7M4 12H9" stroke-linecap="round" stroke-linejoin="round"/>
-                    <text x="7" y="15.5" font-size="6.5" fill="currentColor" stroke="none">15</text>
-                </svg>
-            </button>
-            <button class="fsp-icon-btn fsp-play" title="Play">
-                <svg viewBox="0 0 24 24" fill="#1c1c1e">
+            <button class="fsp-icon-btn fsp-play" title="Play" data-playing="false">
+                <svg class="fsp-icon-play" viewBox="0 0 24 24" fill="#1c1c1e">
                     <polygon points="4,2 20,12 4,22"/>
                 </svg>
-            </button>
-            <button class="fsp-icon-btn" title="Forward 30 seconds">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-                    <path d="M20 12a8 8 0 1 0-2.6 5.9" stroke-linecap="round"/>
-                    <path d="M20 12V7M20 12h-5" stroke-linecap="round" stroke-linejoin="round"/>
-                    <text x="6.5" y="15.5" font-size="6.5" fill="currentColor" stroke="none">30</text>
-                </svg>
-            </button>
-            <button class="fsp-icon-btn" title="Sleep timer">
-                <svg viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M14 3a7 7 0 1 0 7 8.3A6 6 0 0 1 14 3z"/>
-                    <text x="14" y="21" font-size="7" fill="currentColor" stroke="none">z</text>
+                <svg class="fsp-icon-pause" viewBox="0 0 24 24" fill="#1c1c1e" style="display:none;">
+                    <rect x="4" y="3" width="5" height="18" rx="1"/>
+                    <rect x="15" y="3" width="5" height="18" rx="1"/>
                 </svg>
             </button>
         </div>
 
         <div class="fsp-meta">
-            <img class="fsp-thumb" src="data:image/png;base64,{thumb_b64}" />
-            <div class="fsp-text">
-                <div class="fsp-title">{title}</div>
-                <div class="fsp-date">{date}</div>
-                <div class="fsp-scrub"><div class="fsp-scrub-fill"></div></div>
-            </div>
+            <div class="fsp-title">{title}</div>
+            <div class="fsp-date">{date}</div>
         </div>
 
         <div class="fsp-right">
-            <button class="fsp-icon-btn" title="Transcript">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-                    <path d="M4 6h16M4 12h10M4 18h13" stroke-linecap="round"/>
-                </svg>
-            </button>
-            <button class="fsp-icon-btn" title="Up next">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-                    <circle cx="5" cy="6" r="1.4" fill="currentColor" stroke="none"/>
-                    <circle cx="5" cy="12" r="1.4" fill="currentColor" stroke="none"/>
-                    <circle cx="5" cy="18" r="1.4" fill="currentColor" stroke="none"/>
-                    <path d="M9 6h11M9 12h11M9 18h11" stroke-linecap="round"/>
-                </svg>
-            </button>
-            <button class="fsp-icon-btn" title="Devices">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-                    <path d="M4 16a8 8 0 0 1 16 0" stroke-linecap="round"/>
-                    <path d="M7.5 16a4.5 4.5 0 0 1 9 0" stroke-linecap="round"/>
-                    <rect x="9" y="16" width="6" height="4" rx="1"/>
-                </svg>
-            </button>
-            <button class="fsp-icon-btn" title="Volume">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-                    <path d="M4 10v4h4l5 4V6L8 10H4z" stroke-linejoin="round"/>
-                    <path d="M16.5 9a5 5 0 0 1 0 6" stroke-linecap="round"/>
-                </svg>
-            </button>
+            <div class="fsp-volume-wrap">
+                <div class="fsp-volume-pop">
+                    <input type="range" class="fsp-volume-range" min="0" max="100" value="80">
+                </div>
+                <button class="fsp-icon-btn fsp-volume-btn" title="Volume">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                        <path d="M4 10v4h4l5 4V6L8 10H4z" stroke-linejoin="round"/>
+                        <path d="M16.5 9a5 5 0 0 1 0 6" stroke-linecap="round"/>
+                    </svg>
+                </button>
+            </div>
         </div>
     </div>
     """
@@ -502,10 +482,10 @@ def generate_episode(topic, blurb, company, podcasts):
         gr.Warning("Please choose a topic.")
         return (podcasts, *common_noop, _reset_gen_btn())
     if not blurb or not blurb.strip():
-        gr.Warning("The market blurb is mandatory — please add a few sentences.")
+        gr.Warning("The context is mandatory — please add a few sentences to help us understand your needs.")
         return (podcasts, *common_noop, _reset_gen_btn())
     if len(blurb) > 200:
-        gr.Warning(f"Blurb is {len(blurb)} characters — please trim to 200 or fewer.")
+        gr.Warning(f"Prompt is {len(blurb)} characters — please trim to 200 or fewer.")
         return (podcasts, *common_noop, _reset_gen_btn())
     if len(podcasts) >= MAX_TILES:
         gr.Warning(f"Demo grid is capped at {MAX_TILES} podcasts — raise MAX_TILES to allow more.")
@@ -515,6 +495,10 @@ def generate_episode(topic, blurb, company, podcasts):
     company = (company or "").strip()
     keywords = TOPIC_KEYWORDS.get(topic, [topic_label])[:3]
     title = _mock_title(topic_label, company)
+
+    # ---------------------------------
+    # change here for Jay's Data module
+    # ---------------------------------
     entry = _build_podcast(title, topic_label, blurb.strip(), keywords, company=company)
 
     podcasts = podcasts + [entry]
@@ -551,6 +535,8 @@ def _loading_update(label):
 CUSTOM_CSS = """
 .gradio-container {background: #0d0e12 !important; padding-bottom: 110px;}
 #app-title {color: #fff !important; font-weight: 800;}
+#app-subtitle {color: #d0d0d5 !important; margin-top: -0.75rem;}
+#app-subtitle p {font-style: italic; font-size: 20px;}
 #section-title {color: #f2f2f2 !important; margin-top: 0.5rem;}
 
 /* ---- Tile ---- */
@@ -654,11 +640,47 @@ function fspTick() {
   }
 }
 setInterval(fspTick, 800);
+
+// Player bar: play/pause + volume popover toggles. Bound once on
+// `document` via delegation (rather than polling like fspTick above)
+// because #fsp-player-bar itself is a stable wrapper — only its inner
+// HTML gets replaced when a new episode starts playing, so a listener
+// on document survives that regardless of how many times the content
+// underneath it is swapped out.
+document.addEventListener('click', (e) => {
+  const playBtn = e.target.closest('.fsp-play');
+  if (playBtn) {
+    const nowPlaying = playBtn.dataset.playing !== 'true';
+    playBtn.dataset.playing = nowPlaying ? 'true' : 'false';
+    playBtn.title = nowPlaying ? 'Pause' : 'Play';
+    const playIcon = playBtn.querySelector('.fsp-icon-play');
+    const pauseIcon = playBtn.querySelector('.fsp-icon-pause');
+    if (playIcon) playIcon.style.display = nowPlaying ? 'none' : '';
+    if (pauseIcon) pauseIcon.style.display = nowPlaying ? '' : 'none';
+    return;
+  }
+  const volBtn = e.target.closest('.fsp-volume-btn');
+  if (volBtn) {
+    const pop = volBtn.closest('.fsp-volume-wrap').querySelector('.fsp-volume-pop');
+    if (pop) pop.classList.toggle('fsp-open');
+    return;
+  }
+  // Clicking outside the volume control closes the popover.
+  if (!e.target.closest('.fsp-volume-wrap')) {
+    document.querySelectorAll('.fsp-volume-pop.fsp-open').forEach((el) => el.classList.remove('fsp-open'));
+  }
+});
 </script>
 """
 
 with gr.Blocks(title=APP_TITLE) as demo:
     gr.Markdown(f"# 🎙️ {APP_TITLE}", elem_id="app-title")
+    gr.Markdown(
+        "*An \"insider\" brief for investors, strategists, and anyone who wants to be "
+        "ahead of the curve. It turns a topic and a company stock into a proactive "
+        "intelligence podcast.*",
+        elem_id="app-subtitle",
+    )
 
     podcasts_state = gr.State(_seed_podcasts())
 

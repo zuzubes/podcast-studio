@@ -19,7 +19,6 @@ raw_text = """FMR LLC significantly reduced its stake in Lumentum Holdings Inc
     Value and moderate future performance potential despite recent price gains. 
     Other prominent investors like Ken Fisher and Ron Baron also hold positions in Lumentum.""" 
 
-
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
