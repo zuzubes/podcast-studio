@@ -733,7 +733,8 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
 
         topic = gr.Dropdown(
             choices=TOPICS,
-            label="Topics",
+            label="Topic",
+            info="Enter a topic that you're interested in",
         )
         company = gr.Dropdown(
             choices=COMPANY_CHOICES,
@@ -744,6 +745,7 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
         )
         blurb = gr.Textbox(
             label="Share your context on intent, markets, news that brought you here",
+            info="Describe the context and intent behind your podcast idea",
             max_length=200,
             lines=4,
             placeholder="e.g. Focused on US mid-cap industrials, looking to rotate "
