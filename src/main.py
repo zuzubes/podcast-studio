@@ -50,7 +50,6 @@ import hashlib
 import io
 import textwrap
 from datetime import datetime
-
 import gradio as gr
 from PIL import Image, ImageDraw, ImageFont
 
