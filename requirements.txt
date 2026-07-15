@@ -1,5 +1,6 @@
 # Core dependencies
-gradio>4.11
+gradio==4.44.1  # main.py uses @gr.render() (dynamic tile grid), needs gradio>=4.26
+huggingface_hub<0.26  # gradio 4.44.1 imports HfFolder, removed in huggingface_hub 0.26+
 uvicorn==0.24.0
 python-dotenv==1.0.0
 
@@ -10,9 +11,10 @@ requests==2.31.0
 
 # LLM
 openai==1.6.1
+httpx<0.28  # openai 1.6.1 calls httpx.Client(proxies=...), removed in httpx 0.28
 
 # TTS
 pydub==0.25.1
 
 # Utilities
-python-multipart==0.0.6
+python-multipart>=0.0.9  # gradio 4.44.1 requires >=0.0.9

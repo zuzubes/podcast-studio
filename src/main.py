@@ -63,8 +63,8 @@ from data_processor import (
     AlphaVantageError,
     fetch_news_sentiment,  # For debugging/detailed logging
 )    
-from llm_processor import LLMProcessor
-from tts_generator import TTSGenerator
+#from llm_processor import LLMProcessor
+#from tts_generator import TTSGenerator
 
 # --------------------------------------------------------------------------
 # Static config
@@ -274,41 +274,41 @@ def _write_placeholder_audio(podcast_id: str) -> str:
 # Episode construction - Need to figure this out. How to call Vittal's LLM and TTS modules
 # --------------------------------------------------------------------------
 
-# def _build_podcast(title, industry, blurb, keywords, sources_used=None, company="") -> Podcast:
-#     pid = uuid.uuid4().hex[:12]
-#     cover = make_cover(title, industry)
-#     now = datetime.now()
-#     audio_url = _write_placeholder_audio(pid)
-#     cold_open = (
-#         f"1. Cold open — why {industry.lower()} matters right now, "
-#         f"with a focus on {company}.\n" if company else
-#         f"1. Cold open — why {industry.lower()} matters right now.\n"
-#     )
-#     script = (
-#         f"**{title}**\n\n"
-#         f"*Topic:* {industry}  \n"
-#         f"*Company / Ticker:* {company or 'General market coverage'}  \n"
-#         f"*Generated:* {now.strftime('%d %b %Y, %H:%M')}\n\n"
-#         f"**Brief:** {blurb}\n\n"
-#         "---\n"
-#         "**Episode outline** *(mock script — wire up an LLM call here)*\n\n"
-#         f"{cold_open}"
-#         "2. Market backdrop tailored to the stated brief.\n"
-#         "3. The case for and against, and what's already priced in.\n"
-#         "4. Key risks and what would change the thesis.\n"
-#         "5. Close — one thing to watch this week.\n"
-#     )
-#     return Podcast(
-#         id=pid, industry=industry, generated_date=now,
-#         script=script, audio_url=audio_url, sources_used=sources_used or [],
-#         podcast_title=title, podcast_keywords=keywords[:3], cover=cover,
-#     )
+def _build_podcast(title, industry, blurb, keywords, sources_used=None, company="") -> Podcast:
+    pid = uuid.uuid4().hex[:12]
+    cover = make_cover(title, industry)
+    now = datetime.now()
+    audio_url = _write_placeholder_audio(pid)
+    cold_open = (
+        f"1. Cold open — why {industry.lower()} matters right now, "
+        f"with a focus on {company}.\n" if company else
+        f"1. Cold open — why {industry.lower()} matters right now.\n"
+    )
+    script = (
+        f"**{title}**\n\n"
+        f"*Topic:* {industry}  \n"
+        f"*Company / Ticker:* {company or 'General market coverage'}  \n"
+        f"*Generated:* {now.strftime('%d %b %Y, %H:%M')}\n\n"
+        f"**Brief:** {blurb}\n\n"
+        "---\n"
+        "**Episode outline** *(mock script — wire up an LLM call here)*\n\n"
+        f"{cold_open}"
+        "2. Market backdrop tailored to the stated brief.\n"
+        "3. The case for and against, and what's already priced in.\n"
+        "4. Key risks and what would change the thesis.\n"
+        "5. Close — one thing to watch this week.\n"
+    )
+    return Podcast(
+        id=pid, industry=industry, generated_date=now,
+        script=script, audio_url=audio_url, sources_used=sources_used or [],
+        podcast_title=title, podcast_keywords=keywords[:3], cover=cover,
+    )
 
 
-# def _mock_title(topic_label: str, company: str) -> str:
-#     if company:
-#         return f"{company}: {topic_label}"
-#     return f"{topic_label}: Market Signal"
+def _mock_title(topic_label: str, company: str) -> str:
+    if company:
+        return f"{company}: {topic_label}"
+    return f"{topic_label}: Market Signal"
 
 # --------------------------------------------------------------------------
 # Seed data — a few "New Shows" so the home screen isn't empty on first load
@@ -673,7 +673,8 @@ document.addEventListener('click', (e) => {
 </script>
 """
 
-with gr.Blocks(title=APP_TITLE) as demo:
+with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
+               css=CUSTOM_CSS, head=HEAD_SCRIPT) as demo:
     gr.Markdown(f"# 🎙️ {APP_TITLE}", elem_id="app-title")
     gr.Markdown(
         "*An \"insider\" brief for investors, strategists, and anyone who wants to be "
@@ -704,7 +705,9 @@ with gr.Blocks(title=APP_TITLE) as demo:
                             value=p.cover,
                             show_label=False, container=False,
                             interactive=False,
-                            buttons=[],
+                            show_download_button=False,
+                            show_share_button=False,
+                            show_fullscreen_button=False,
                             elem_classes="fsp-tile-img",
                         )
                         gr.HTML(value=_tile_caption(p))
@@ -781,7 +784,7 @@ with gr.Blocks(title=APP_TITLE) as demo:
 
 
 if __name__ == "__main__":
-    # Gradio >= 6.0 takes theme/css/head on launch(); on older 4.x/5.x
-    # installs, move theme=/css=/head= into the gr.Blocks(...) call above.
-    demo.launch(theme=gr.themes.Base(primary_hue="purple"), css=CUSTOM_CSS,
-                head=HEAD_SCRIPT, share=True)
+    # theme=/css=/head= live on the gr.Blocks(...) call above — this
+    # gradio version (4.44.1) doesn't accept them on launch() (that's a
+    # Gradio >= 6.0 signature).
+    demo.launch(share=True)
