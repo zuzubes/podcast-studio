@@ -1,6 +1,6 @@
 # 🔮 The Future Signal Brief — Podcast Studio
 
-A weak-signal audio trend report generator. Most news briefs tell you what's
+A market signal audio trend report generator. Most news briefs tell you what's
 trending — this one hunts for the seeds of tomorrow's stories in Alpha
 Vantage news + sentiment data, has an LLM write a ~5 minute "this isn't in
 the headlines yet, but..." script, converts it to speech, and serves it in a
@@ -40,8 +40,8 @@ Library tab: tile appears, user presses play
 ```
 
 Generation runs in a **background thread**, so the user is returned to the
-Library immediately and sees a "⏳ generating" tile until the MP3 lands on
-disk (click 🔄 Refresh to check).
+Library immediately and sees a "Generating..." tile until the MP3 lands on
+disk.
 
 ## Setup
 
@@ -58,15 +58,15 @@ cd src && python main.py
 # open http://127.0.0.1:7860
 ```
 
-## Testing each module on its own
+## Testing some modules on its own
 
-Each file has a `if __name__ == "__main__"` block so you can learn/debug one
+Most files have a `if __name__ == "__main__"` block so you can learn/debug one
 layer at a time:
 
 ```bash
 cd src
 python data_processor.py                  # hits Alpha Vantage (uses 1 of your 25 daily calls)
-python llm_processor.py                   # uses FAKE news data — no Alpha Vantage call
+python llm_processor.py                   # summarise the new articles and call LLM for getting text script — no Alpha Vantage call
 python tts_generator.py ../output/AAPL_..._script.json   # turns a saved script into audio
 ```
 
