@@ -930,6 +930,21 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Base(primary_hue="purple"),
     # Closing the transcript also stops playback (no point leaving audio
     # running with no visible player/transcript) and returns to the home
     # view — closing is treated as "I'm done with this episode."
+    #
+    # The audio is paused via direct JS *before* the Python call clears
+    # player_audio's value. Clearing the value while the browser is still
+    # fetching/decoding that file aborts the request, and Gradio's
+    # wavesurfer-based player surfaces aborted loads as a visible "Error"
+    # badge in place of the waveform. Pausing first lets playback stop
+    # cleanly so the value-clear that follows never races an in-flight load.
+    # Two independent listeners on the same click (not chained with .then())
+    # — a fn=None/js-only event has no server round-trip to chain after, so
+    # .then() never fired the second step. Both fire off the same click.
+    close_transcript_btn.click(
+        None,
+        js="() => { const a = document.querySelector('#fsp-audio-player audio'); if (a) { a.pause(); } }",
+        show_api=False,
+    )
     close_transcript_btn.click(
         lambda: (
             gr.update(visible=False),  # player_bar
