@@ -758,26 +758,37 @@ CUSTOM_CSS += f"""
 """
 
 # Client-side only: wires the Prev/Next carousel buttons to scroll the
-# track (no server round-trip needed for a visual scroll). Re-runs on an
-# interval because Gradio re-renders the tile grid on state updates, which
-# would otherwise wipe the listeners we attached once.
+# track (no server round-trip needed for a visual scroll). The buttons
+# themselves are static, but .fsp-carousel-track lives inside the
+# @gr.render block and gets replaced with a brand-new DOM node every time
+# podcasts_state changes (e.g. after generating an episode). Each click
+# handler re-queries the track live rather than closing over one fixed
+# reference, so it keeps working after that node is swapped out — only
+# the *binding* (fspBound) needs to happen once, not the track lookup.
 HEAD_SCRIPT = """
 <script>
 function fspTick() {
-  const track = document.querySelector('.fsp-carousel-track');
   const prev = document.getElementById('fsp-carousel-prev');
   const next = document.getElementById('fsp-carousel-next');
-  const step = () => {
+  const step = (track) => {
     const tile = track ? track.querySelector('.fsp-tile-col') : null;
     return tile ? tile.getBoundingClientRect().width + 16 : 220;
   };
-  if (track && prev && !prev.dataset.fspBound) {
+  if (prev && !prev.dataset.fspBound) {
     prev.dataset.fspBound = "1";
-    prev.addEventListener('click', (e) => { e.preventDefault(); track.scrollBy({left: -step(), behavior: 'smooth'}); });
+    prev.addEventListener('click', (e) => {
+      e.preventDefault();
+      const track = document.querySelector('.fsp-carousel-track');
+      if (track) track.scrollBy({left: -step(track), behavior: 'smooth'});
+    });
   }
-  if (track && next && !next.dataset.fspBound) {
+  if (next && !next.dataset.fspBound) {
     next.dataset.fspBound = "1";
-    next.addEventListener('click', (e) => { e.preventDefault(); track.scrollBy({left: step(), behavior: 'smooth'}); });
+    next.addEventListener('click', (e) => {
+      e.preventDefault();
+      const track = document.querySelector('.fsp-carousel-track');
+      if (track) track.scrollBy({left: step(track), behavior: 'smooth'});
+    });
   }
 }
 setInterval(fspTick, 800);
